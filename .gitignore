@@ -19,3 +19,7 @@ dist/
 
 # Editor / OS
 .DS_Store
+
+# Local-only planning docs (kept out of the deploy repo)
+docs/plans/
+docs/superpowers/
