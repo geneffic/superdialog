@@ -1,0 +1,96 @@
+{
+  "system_prompt": "You are an agent collecting KYC details from the caller. Be polite and verify everything.",
+  "initial_node": "greet",
+  "objective": "Collect full name, date of birth, and PAN number from the caller.",
+  "agent_language": "en",
+  "agent_gender": "female",
+  "agent_tone": "professional",
+  "environment_variables": {
+    "company_name": "Acme Bank"
+  },
+  "tools": [
+    {
+      "id": "lookup_pan",
+      "name": "lookup_pan",
+      "description": "Look up a PAN number in the KYC database",
+      "input_schema": {
+        "type": "object",
+        "properties": {"pan": {"type": "string"}},
+        "required": ["pan"]
+      },
+      "handler_id": "kyc.lookup_pan"
+    }
+  ],
+  "actions": [
+    {
+      "id": "post_kyc",
+      "name": "post_kyc",
+      "description": "Submit collected KYC payload to internal API.",
+      "method": "POST",
+      "url": "https://api.example.com/kyc",
+      "headers": {"Content-Type": "application/json"},
+      "body": "{\"name\": \"{{name}}\", \"pan\": \"{{pan}}\"}",
+      "timeout": 15
+    }
+  ],
+  "nodes": [
+    {
+      "id": "greet",
+      "name": "Greet",
+      "static_text": "Hello, this is {{company_name}}. I will help you complete KYC.",
+      "is_final": false,
+      "edges": [
+        {
+          "id": "greet_to_name",
+          "condition": "always",
+          "target_node_id": "collect_name"
+        }
+      ]
+    },
+    {
+      "id": "collect_name",
+      "name": "Collect Name",
+      "instruction": "Ask the caller for their full legal name.",
+      "edges": [
+        {
+          "id": "name_to_dob",
+          "condition": "name_provided",
+          "target_node_id": "collect_dob",
+          "criteria": [
+            {"key": "name", "description": "Full legal name", "required": true}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "collect_dob",
+      "name": "Collect DOB",
+      "instruction": "Ask the caller for their date of birth in DD/MM/YYYY format.",
+      "edges": [
+        {
+          "id": "dob_to_pan",
+          "condition": "dob_provided",
+          "target_node_id": "collect_pan"
+        }
+      ]
+    },
+    {
+      "id": "collect_pan",
+      "name": "Collect PAN",
+      "instruction": "Ask the caller for their 10-character PAN number.",
+      "edges": [
+        {
+          "id": "pan_to_done",
+          "condition": "pan_provided",
+          "target_node_id": "done"
+        }
+      ]
+    },
+    {
+      "id": "done",
+      "name": "Done",
+      "static_text": "Thank you, your KYC is submitted. Goodbye.",
+      "is_final": true
+    }
+  ]
+}

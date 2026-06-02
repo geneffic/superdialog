@@ -1,0 +1,61 @@
+{
+  "system_prompt": "You handle support escalations. Be empathetic and efficient.",
+  "initial_node": "triage",
+  "objective": "Triage the caller's issue and either resolve or escalate to a human.",
+  "global_edges": [
+    {
+      "id": "global_to_human",
+      "condition": "user_requests_human",
+      "target_node_id": "handoff"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "triage",
+      "name": "Triage",
+      "instruction": "Ask the caller to describe their issue in one sentence.",
+      "edges": [
+        {
+          "id": "triage_to_resolve",
+          "condition": "low_severity",
+          "target_node_id": "resolve"
+        },
+        {
+          "id": "triage_to_handoff",
+          "condition": "high_severity",
+          "target_node_id": "handoff"
+        }
+      ]
+    },
+    {
+      "id": "resolve",
+      "name": "Resolve",
+      "instruction": "Walk the caller through self-service troubleshooting steps.",
+      "max_turns": 5,
+      "edges": [
+        {
+          "id": "resolve_to_done",
+          "condition": "issue_resolved",
+          "target_node_id": "done"
+        },
+        {
+          "id": "resolve_to_handoff",
+          "condition": "needs_human",
+          "target_node_id": "handoff"
+        }
+      ]
+    },
+    {
+      "id": "handoff",
+      "name": "Handoff",
+      "static_text": "Transferring you to a human agent now. Please hold.",
+      "is_final": true
+    },
+    {
+      "id": "done",
+      "name": "Done",
+      "static_text": "Glad we could resolve that. Have a good day.",
+      "is_final": true
+    }
+  ]
+}

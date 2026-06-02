@@ -1,0 +1,49 @@
+[project]
+name = "superdialog"
+version = "0.1.0a1"
+description = "Standalone dialog state machine framework — text in, text out."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Unpod", email = "parvinder@unpod.ai" }]
+dependencies = [
+  "pydantic>=2.5",
+  "transitions>=0.9",
+  "litellm>=1.50",
+  "httpx>=0.27",
+  "typing-extensions>=4.10",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+livekit = ["livekit-agents>=0.12"]
+pipecat = ["pipecat-ai>=0.0.50"]
+fastapi = ["fastapi>=0.110", "uvicorn>=0.27"]
+ws = ["websockets>=12"]
+mcp = ["mcp>=0.9"]
+langchain = ["langchain-core>=0.3"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "anyio>=4", "ruff>=0.4", "pyrefly>=0.1"]
+
+[project.scripts]
+superdialog = "superdialog.cli.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/superdialog"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint.per-file-ignores]
+# Ported legacy tests use patterns (assigning to `result` to capture call
+# shape, top-of-file imports gated behind a `pytest.importorskip`) that
+# aren't worth scrubbing during the slim port. See Task 7.
+"tests/dialog_machine/*" = ["F841", "E402", "F811"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

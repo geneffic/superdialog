@@ -1,0 +1,107 @@
+{
+  "system_prompt": "You are a friendly appointment scheduling assistant for a dental clinic. Be warm and professional.",
+  "initial_node": "greeting",
+  "agent_gender": "female",
+  "agent_language": "en",
+  "global_edges": [
+    {
+      "id": "global_faq",
+      "condition": "User asks a general question about the clinic",
+      "target_node_id": "faq"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "greeting",
+      "name": "Greeting",
+      "static_text": "Hi! Welcome to Smile Dental Clinic. I can help you book an appointment. Are you a new or returning patient?",
+      "edges": [
+        {
+          "id": "greeting_to_collect_info",
+          "condition": "User indicates new or returning patient status",
+          "target_node_id": "collect_info"
+        },
+        {
+          "id": "greeting_to_faq",
+          "condition": "User asks a general question about the clinic",
+          "target_node_id": "faq"
+        }
+      ]
+    },
+    {
+      "id": "collect_info",
+      "name": "Collect Patient Info",
+      "instruction": "Collect the patient's full name and preferred appointment date. Confirm each piece of information as you receive it.",
+      "interruptible": true,
+      "completion_criteria": [
+        {
+          "key": "patient_name",
+          "description": "Patient's full name",
+          "required": true
+        },
+        {
+          "key": "preferred_date",
+          "description": "Preferred appointment date",
+          "required": true
+        }
+      ],
+      "allow_skip": false,
+      "max_turns": 5,
+      "edges": [
+        {
+          "id": "info_to_confirm",
+          "condition": "Both name and preferred date are collected",
+          "target_node_id": "confirm"
+        },
+        {
+          "id": "info_to_goodbye",
+          "condition": "User wants to cancel the booking process",
+          "target_node_id": "goodbye",
+          "is_fallback": true
+        }
+      ]
+    },
+    {
+      "id": "faq",
+      "name": "FAQ",
+      "instruction": "Answer the user's question about the clinic. We accept most insurance plans, are open Mon-Fri 9am-5pm, and are located at 123 Main Street.",
+      "edges": [
+        {
+          "id": "faq_to_collect_info",
+          "condition": "User is ready to proceed with booking",
+          "target_node_id": "collect_info"
+        },
+        {
+          "id": "faq_to_goodbye",
+          "condition": "User has no more questions and does not want to book",
+          "target_node_id": "goodbye"
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "name": "Confirm Appointment",
+      "static_text": "I've got you booked! You'll receive a confirmation text shortly. Is there anything else I can help with?",
+      "interruptible": false,
+      "edges": [
+        {
+          "id": "confirm_to_goodbye",
+          "condition": "User confirms or has no further questions",
+          "target_node_id": "goodbye"
+        },
+        {
+          "id": "confirm_to_faq",
+          "condition": "User has an additional question",
+          "target_node_id": "faq"
+        }
+      ]
+    },
+    {
+      "id": "goodbye",
+      "name": "Goodbye",
+      "static_text": "Thank you for calling Smile Dental Clinic. Have a great day!",
+      "is_final": true
+    }
+  ],
+  "actions": []
+}

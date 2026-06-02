@@ -1,0 +1,4 @@
+# Ignore all traversal files but keep the directory
+*
+!.gitkeep
+!.gitignore
