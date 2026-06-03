@@ -3,19 +3,19 @@
 **Standalone dialog state machine framework. Pure text in, pure text out.**
 
 SuperDialog is the **brain** layer for conversational systems. It turns a prompt
-or a flow graph into a running dialog state machine — managing turn-by-turn
+or a flow graph into a running dialog state machine - managing turn-by-turn
 logic, tool calls, flow transitions, and conversation memory.
 
 ```
 User text → DialogMachine.turn() → Agent reply text
 ```
 
-Audio, STT, TTS, telephony, and media servers are out of scope — those belong to
+Audio, STT, TTS, telephony, and media servers are out of scope - those belong to
 voice infrastructure like LiveKit, PipeCat, or the Unpod Voice Platform.
 SuperDialog ends at text in, text out.
 
 > SuperDialog is to **conversation flow** what n8n is to **integration
-> workflow** — a small, composable, eval-able runtime for orchestrating
+> workflow** - a small, composable, eval-able runtime for orchestrating
 > turn-by-turn logic. Where LangChain and LangGraph expose general agent
 > primitives, SuperDialog focuses narrowly on the conversational state machine:
 > who speaks next, what flow to switch to, when to call a tool, when to escalate.
@@ -30,7 +30,7 @@ WhatsApp thread, an Intercom widget, or a CLI test harness. Coupling it to
 telephony forecloses every non-voice use case.
 
 **The dependency direction matters.** Voice infrastructure should depend on
-SuperDialog (as one brain option), not the other way around — keeping the
+SuperDialog (as one brain option), not the other way around - keeping the
 framework portable and the platform composable.
 
 Because the interface is text-only, **every dialog is a unit-testable function.**
@@ -60,7 +60,7 @@ import asyncio
 from superdialog import create_dialog_flow, DialogMachine, Flow
 
 # 1. Bootstrap a flow from a prompt (one-shot LLM call at construction).
-#    The build LLM is used ONLY here — never at runtime.
+#    The build LLM is used ONLY here - never at runtime.
 async def build():
     flow = await create_dialog_flow(
         prompt="Confirm appointment. Ask if Friday 4pm works; offer 5pm if not.",
@@ -92,7 +92,7 @@ superdialog chat appointment.json
 
 ## Add a tool
 
-Three shapes, one interface — Python callables, HTTP endpoints, MCP servers:
+Three shapes, one interface - Python callables, HTTP endpoints, MCP servers:
 
 ```python
 from superdialog import DialogMachine, Flow, PythonTool
@@ -113,7 +113,7 @@ the flow's slots and can trigger an edge transition.
 
 ## Model URIs
 
-Pick a provider per machine with a LiveKit/litellm-style URI — and swap it at
+Pick a provider per machine with a LiveKit/litellm-style URI - and swap it at
 runtime with `dialog_machine.set_llm(uri)`:
 
 | URI | Routes to |
@@ -149,15 +149,15 @@ SuperDialog code is identical.
 
 | Host | Adapter | Approx. LoC |
 |---|---|---|
-| **CLI** | none — `superdialog chat` or an `input()`/`print()` loop | ~5 |
+| **CLI** | none - `superdialog chat` or an `input()`/`print()` loop | ~5 |
 | **LiveKit** | `superdialog.adapters.livekit.DialogMachineLLM` (`Agent(llm=...)` plugin) | ~6 |
 | **PipeCat** | `superdialog.adapters.pipecat.make_processor(dm)` | ~2 |
 | **FastAPI** | direct `/turn` route, or a `SessionWorker` for multi-user | ~6 |
 | **Unpod Voice** | `superdialog.adapters.websocket.WebSocketRunner` | ~6 |
-| **Slack / Discord / IRC / etc.** | none — direct callback | ~3 |
+| **Slack / Discord / IRC / etc.** | none - direct callback | ~3 |
 
 ```python
-# LiveKit — same dialog_machine, ~6 lines
+# LiveKit - same dialog_machine, ~6 lines
 from livekit.agents import Agent, AgentSession
 from superdialog.adapters.livekit import DialogMachineLLM
 
@@ -206,19 +206,19 @@ same machinery.
 | Tools (Python / HTTP / MCP), `FlowSet` + `switch_flow` | ✅ v0.1 |
 | CLI (`chat`, `flow lint / draw / generate`) | ✅ v0.1 |
 | Adapters (LiveKit, PipeCat, FastAPI, WebSocket) | ✅ v0.1 |
-| `SessionWorker` — multi-conversation lifecycle + persistence | ✅ v0.2 |
-| `LLMAgent`, `LangChainAgent` — non-DM brains | ✅ v0.2 |
-| `assist(text)` — mid-conversation system injection | ✅ v0.2 |
+| `SessionWorker` - multi-conversation lifecycle + persistence | ✅ v0.2 |
+| `LLMAgent`, `LangChainAgent` - non-DM brains | ✅ v0.2 |
+| `assist(text)` - mid-conversation system injection | ✅ v0.2 |
 | Distributed stores (Redis / File / SQLite) + `RedisLockBackend` | 🔜 v0.3 |
 | `Eval` harness + `superdialog eval` CLI | 🔜 v0.3 |
 | True provider-level streaming inference | 🔜 v0.4 |
 
 ## What it is not
 
-- **Not a UI flow designer** — that belongs to a downstream tool.
-- **Not a voice framework** — audio, STT, TTS are out of scope.
-- **Not multi-modal** — text only at the interface (vision/audio via tools).
-- **Not a hosted service** — a library. Hosting is offered by the Unpod Voice
+- **Not a UI flow designer** - that belongs to a downstream tool.
+- **Not a voice framework** - audio, STT, TTS are out of scope.
+- **Not multi-modal** - text only at the interface (vision/audio via tools).
+- **Not a hosted service** - a library. Hosting is offered by the Unpod Voice
   Platform for those who want it.
 
 ## Documentation
