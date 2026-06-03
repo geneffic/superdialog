@@ -19,6 +19,36 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
+# ── Language extraction patterns ─────────────────────────────────────────────
+# Handles all common formats so generate_reply() avoids a second LLM call:
+#   [EN] / [HI]   — uppercase block markers (classic format)
+#   [en] / [hi]   — lowercase
+#   [En] / [Hi]   — mixed case
+#   {EN} / {HI} / {en} / {hi}  — curly-brace variants
+#   EN line: '...' / HI line: '...'  — line format used in new BOB flows
+
+_LANG_LINE_RE = re.compile(
+    r"(?:^|\n)\s*(?P<lang>[A-Za-z]{2})\s+line\s*:\s*['\"](.+?)['\"]",
+    re.MULTILINE,
+)
+
+_LANG_BLOCK_CI_RE = re.compile(
+    r"(?:\[|\{)([A-Za-z]{2})(?:\]|\})\s*(.+?)(?=\n?(?:\[|\{)[A-Za-z]{2}(?:\]|\})|\Z)",
+    re.DOTALL,
+)
+
+# Matches "--- ENGLISH SCRIPT ... ---" / "--- HINGLISH SCRIPT ... ---" sections.
+# Captures (1) section label (ENGLISH|HINGLISH|HINDI) and (2) text until next ---
+_SCRIPT_SECTION_RE = re.compile(
+    r"---\s+(ENGLISH|HINDI|HINGLISH)\s+SCRIPT[^-\n]*---\s*\n(.*?)(?=\n\s*---|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+# Maps 2-char language code → accepted section labels (priority order)
+_SCRIPT_LANG_MAP: dict[str, list[str]] = {
+    "EN": ["ENGLISH"],
+    "HI": ["HINGLISH", "HINDI"],
+}
+
 from jinja2 import BaseLoader, ChainableUndefined, Environment
 
 from superdialog.machine.composer import _LANG_MARKER_RE
@@ -55,6 +85,48 @@ def _is_zero_speech_step(rendered_instruction: str) -> bool:
         if not m.group(1):  # empty value → required field missing
             return False
     return found_any
+
+
+def _extract_for_language(instruction: str, lang: str) -> str | None:
+    """Extract speech text for *lang* from instruction without calling an LLM.
+
+    Tried in order:
+      1. ``XX line: '...'``  — new BOB-style line format
+      2. ``[XX]`` / ``{XX}`` block markers (case-insensitive)
+      3. ``--- LANGUAGE SCRIPT --- ... ---`` sections (script-reader format)
+
+    Returns the stripped text or None when no match.
+    """
+    if not instruction:
+        return None
+    target = lang.upper()[:2]  # "EN" or "HI"
+
+    # 1. "XX line: '...'" format
+    for m in _LANG_LINE_RE.finditer(instruction):
+        if m.group("lang").upper() == target:
+            text = m.group(2).strip()
+            if text:
+                return text
+
+    # 2. Block markers [XX] / {XX} (case-insensitive)
+    for m in _LANG_BLOCK_CI_RE.finditer(instruction):
+        if m.group(1).upper() == target:
+            text = m.group(2).strip()
+            if text:
+                return text
+
+    # 3. "--- LANGUAGE SCRIPT --- ... --- END --- " sections (script-reader format)
+    accepted = _SCRIPT_LANG_MAP.get(target, [target])
+    for label in accepted:
+        for m in _SCRIPT_SECTION_RE.finditer(instruction):
+            if m.group(1).upper() == label.upper():
+                text = m.group(2).strip()
+                # Strip trailing "--- END ... ---" line if captured
+                text = re.sub(r"\s*---\s+END\b.*", "", text, flags=re.DOTALL).strip()
+                if text:
+                    return text
+
+    return None
 
 
 def _extract_agent_says(instruction: str) -> str | None:
@@ -143,6 +215,10 @@ class ToolCallAdapter:
         # HTTP action execution state (same as LLMAdapter)
         self._env_vars: dict[str, str] = dict(environment_variables or {})
         self._jinja_env = Environment(loader=BaseLoader(), undefined=ChainableUndefined)
+        # Streaming: callback fired with pre-generated text when edge_id is known,
+        # allowing TTS to start before criteria evaluation finishes.
+        self._edge_id_callback: Any | None = None
+        self._pre_generated_response: str | None = None
         # GET-only URL cache: keyed by "METHOD:rendered_url".
         # Prevents duplicate GET calls with identical parameters (e.g. courses-by-city
         # firing twice when chain visits list_courses_in_city then ask_course_preference).
@@ -203,6 +279,10 @@ class ToolCallAdapter:
         base = f"{flow_system_prompt}\n\n{node_instruction}".strip() if flow_system_prompt else node_instruction
         return f"{time_line}\n\n{base}"
 
+    def set_edge_id_callback(self, callback: Any | None) -> None:
+        """Set async callback(text: str) fired with pre-generated response when edge_id known."""
+        self._edge_id_callback = callback
+
     # ------------------------------------------------------------------
     # Adapter surface
     # ------------------------------------------------------------------
@@ -221,16 +301,26 @@ class ToolCallAdapter:
         """Generate speech for a node entry.
 
         Priority:
+        0. Pre-generated response from early streaming (0 LLM calls, already streamed to TTS)
         1. [EN]/[HI] language markers → extract relevant language line (0 LLM calls)
         2. "Agent says: <text>" prefix → extract speech line (0 LLM calls)
         3. Call LLM with rendered instruction (1 LLM call — complex/template flows)
         """
+        # Return early response pre-generated during criteria streaming (avoid 2nd LLM call)
+        if self._pre_generated_response is not None:
+            pre = self._pre_generated_response
+            self._pre_generated_response = None
+            self.responses.append(pre)
+            return pre
+
         lang = _resolve_lang(self._machine) if self._machine else "en"
 
         # Render Jinja2 templates with current userdata before extraction/LLM
+        # Always render templates — _build_context merges env_vars (name, expected_yob, etc.)
+        # with userdata. Skipping when userdata is empty would leave {{name}} unresolved.
         rendered_instruction = instruction
-        if userdata and "{{" in instruction:
-            ctx = self._build_context(userdata)
+        if "{{" in instruction:
+            ctx = self._build_context(userdata or {})
             rendered_instruction = self._render(instruction, ctx)
 
         # Code-level zero-speech gate: if the rendered instruction explicitly
@@ -242,10 +332,16 @@ class ToolCallAdapter:
             logger.debug("[ToolCallAdapter] zero-speech gate triggered — skipping entry speech")
             return ""
 
-        # Try language markers first ([EN]/[HI])
-        # Skip shortcut when multiple blocks for the same language exist —
-        # multi-step nodes (e.g. category_healing_village with 4 [EN] blocks)
-        # require LLM to pick the right step based on conversation progress.
+        # 1. Try language-specific extraction (EN line: / [EN] / {EN} — all variants).
+        #    Single [EN]+[HI] pair or "XX line:" nodes → zero extra LLM call.
+        #    Multi-block nodes (>2 blocks for the same lang) still go to LLM so
+        #    it can pick the right step based on conversation progress.
+        lang_extracted = _extract_for_language(rendered_instruction, lang)
+        if lang_extracted:
+            self.responses.append(lang_extracted)
+            return lang_extracted
+
+        # 2. Fallback: classic [EN]/[HI] uppercase block markers via composer.
         _lang_match_count = sum(
             1 for m in _LANG_MARKER_RE.finditer(rendered_instruction)
             if m.group(1).lower() == lang or (lang != "en" and m.group(1).lower() == "en")
@@ -316,7 +412,7 @@ class ToolCallAdapter:
         history: list[dict[str, Any]],
         userdata: dict[str, Any],
     ) -> CriteriaResult:
-        """Evaluate via LLM tool-calling (mirrors SimpleFlowAgent)."""
+        """Evaluate via LLM tool-calling (streaming for early edge_id detection)."""
         from openai import AsyncOpenAI
 
         machine = self._machine
@@ -342,84 +438,187 @@ class ToolCallAdapter:
         if not tools:
             return CriteriaResult(node_id=node.id)
 
+        # Always add a stay-on-node escape hatch so the LLM never force-fits
+        # ambiguous input to a real edge. tool_choice="required" means the LLM
+        # MUST call something — without this it picks the closest-sounding edge
+        # even when none are satisfied (compliments, off-topic, partial sentences).
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "__stay_on_node__",
+                "description": (
+                    "Call this when the caller's response does NOT clearly and "
+                    "unambiguously satisfy ANY of the listed edge conditions. "
+                    "ALWAYS call this for: (1) asking agent to repeat/re-read "
+                    "information ('address बताइए', 'फिर से बोलिए', 'what did you say', "
+                    "'tell me again', 'didn't hear', 'repeat'); "
+                    "(2) ambiguous/off-topic input, compliment, filler, partial sentence; "
+                    "(3) 'no' as a correction not a goodbye; "
+                    "(4) any question about what was just said. "
+                    "Staying is ALWAYS safer than a wrong transition. When in doubt — stay. "
+                    "IMPORTANT: set brief_response to a SHORT contextual reply "
+                    "(1-2 sentences max). If caller asked to repeat specific info, "
+                    "repeat ONLY that info. If caller asked a clarifying question, "
+                    "answer briefly. Do NOT repeat the full agent turn."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "brief_response": {
+                            "type": "string",
+                            "description": (
+                                "Short contextual reply (1-2 sentences). "
+                                "Repeat ONLY what was asked for — e.g. if caller "
+                                "asked for address, say only the address. "
+                                "Leave empty if no specific reply needed."
+                            ),
+                        }
+                    },
+                },
+            },
+        })
+
         instructions = (
             self._build_instructions(node, machine) if machine else self._system_prompt
         )
 
-        # Inject non-meta userdata as explicit context so router nodes
-        # can reliably check slot values (e.g. {{name}}) without relying
-        # solely on Jinja2 template rendering, which can confuse the LLM.
+        # Prepend routing discipline so LLM prefers __stay_on_node__ over false matches
+        _routing_rule = (
+            "ROUTING RULE: Call __stay_on_node__ unless the caller's message "
+            "CLEARLY and UNAMBIGUOUSLY satisfies one specific edge condition. "
+            "MANDATORY __stay_on_node__ cases:\n"
+            "- CONTEXT MISMATCH: caller says something that has nothing to do with "
+            "the agent's current question (e.g. agent asked 'can we talk?' and "
+            "caller says a year/number; agent asked yes/no and caller gave unrelated "
+            "data; the input makes no sense as an answer to the current question)\n"
+            "- Asking agent to repeat/re-read ('address बताइए', 'फिर से बोलिए', "
+            "'didn't hear', 'what was that', 'tell me again')\n"
+            "- Compliments, tangents, frustration outbursts, filler, testing phrases\n"
+            "- Partial or cut-off sentences\n"
+            "- 'no' as a correction not a goodbye\n"
+            "- 'thank you for confirming' — NOT a card receipt confirmation\n"
+            "- Any response that doesn't directly answer the agent's current question\n"
+            "OBJECTIVE RULE: Always complete the current node's objective before "
+            "transitioning. If the caller's response doesn't fulfill the objective, stay.\n"
+            "Never force-fit an off-topic response to the closest-sounding edge."
+        )
+        instructions = f"{_routing_rule}\n\n{instructions}"
+
         _slot_ctx = {k: v for k, v in userdata.items() if k != "_flow_meta" and v not in (None, "")}
         if _slot_ctx:
             _slot_lines = "\n".join(f"  {k}: {v}" for k, v in _slot_ctx.items())
             instructions = f"{instructions}\n\n[CURRENT DATA]\n{_slot_lines}"
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": instructions},
-        ]
+        messages: list[dict[str, Any]] = [{"role": "system", "content": instructions}]
         for msg in history[-10:]:
             messages.append(msg)
 
         client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
         _t0 = time.perf_counter()
         try:
-            response = await client.chat.completions.create(
+            stream = await client.chat.completions.create(
                 model=_strip_provider_prefix(self._model_id),
                 messages=messages,
                 tools=tools,
                 tool_choice="required",
                 temperature=0,
+                stream=True,
+                stream_options={"include_usage": True},
             )
         except Exception as exc:
             logger.error("[ToolCallAdapter] LLM call failed: %s", exc)
             return CriteriaResult(node_id=node.id)
 
+        function_name = ""
+        function_args = ""
+        edge_id_fired = False
+        valid_edge_ids = {e.id for e in (node.edges or [])}
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        try:
+            async for chunk in stream:
+                # Usage arrives in a trailing chunk with no choices
+                if not chunk.choices:
+                    usage = getattr(chunk, "usage", None)
+                    if usage:
+                        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                        completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                    continue
+
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                if delta.tool_calls:
+                    tc = delta.tool_calls[0]
+                    fn = getattr(tc, "function", None)
+                    if fn:
+                        function_name += getattr(fn, "name", None) or ""
+                        function_args += getattr(fn, "arguments", None) or ""
+
+                # Fire early-response callback as soon as a valid edge_id is complete.
+                # Verified against node.edges so partial/hallucinated names are skipped.
+                if (
+                    not edge_id_fired
+                    and function_name
+                    and function_name in valid_edge_ids
+                    and self._edge_id_callback
+                ):
+                    edge_id_fired = True
+                    await self._fire_early_response(function_name, node)
+
+                if choice.finish_reason == "tool_calls":
+                    break
+        except Exception as exc:
+            logger.error("[ToolCallAdapter] streaming error: %s", exc)
+            if not function_name:
+                return CriteriaResult(node_id=node.id)
+
         latency_ms = (time.perf_counter() - _t0) * 1000
-        usage = getattr(response, "usage", None)
         print(
             f"[LLM] {latency_ms:.0f}ms  "
-            f"in={getattr(usage, 'prompt_tokens', 0)} "
-            f"out={getattr(usage, 'completion_tokens', 0)} tok  "
+            f"in={prompt_tokens} out={completion_tokens} tok  "
             f"model={self._model_id}"
         )
 
-        choice = response.choices[0]
-
-        if not choice.message.tool_calls:
+        if not function_name:
             logger.info("[ToolCallAdapter] no tool_call returned for node=%s", node.id)
             return CriteriaResult(node_id=node.id)
 
-        tool_call = choice.message.tool_calls[0]
-        edge_id = tool_call.function.name
-        extracted_slots: dict[str, Any] = {}
+        if function_name == "__stay_on_node__":
+            brief = ""
+            if function_args:
+                try:
+                    brief = json.loads(function_args).get("brief_response", "") or ""
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            logger.info("[ToolCallAdapter] stay_on_node brief=%r node=%s", brief[:60], node.id)
+            return CriteriaResult(node_id=node.id, response=brief)
 
-        if tool_call.function.arguments:
+        edge_id = function_name
+        extracted_slots: dict[str, Any] = {}
+        if function_args:
             try:
-                extracted_slots = json.loads(tool_call.function.arguments)
+                extracted_slots = json.loads(function_args)
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Strip keys not in the edge's schema — prevents LLM hallucinating extra
-        # fields (e.g. collected_name: "unknown") that pollute userdata and cause
-        # downstream nodes to appear pre-filled, skipping required user interactions.
-        matched_descriptor = next(
-            (d for d in descriptors if d.id == edge_id), None
-        )
+        matched_descriptor = next((d for d in descriptors if d.id == edge_id), None)
         if matched_descriptor and matched_descriptor.input_schema:
-            allowed_keys = set(
-                matched_descriptor.input_schema.get("properties", {}).keys()
-            )
+            schema = matched_descriptor.input_schema
+            allowed_keys = set(schema.get("properties", {}).keys())
             if allowed_keys:
-                extracted_slots = {
-                    k: v for k, v in extracted_slots.items() if k in allowed_keys
-                }
+                extracted_slots = {k: v for k, v in extracted_slots.items() if k in allowed_keys}
+            # Auto-fill required fields with single-value enums — these are constants,
+            # not LLM-extracted. LLM often omits them; we set them deterministically.
+            props = schema.get("properties", {})
+            for req_key in schema.get("required", []):
+                if req_key not in extracted_slots and req_key in props:
+                    enum_vals = props[req_key].get("enum", [])
+                    if len(enum_vals) == 1:
+                        extracted_slots[req_key] = enum_vals[0]
 
-        logger.info(
-            "[ToolCallAdapter] tool_call=%s slots=%s node=%s",
-            edge_id,
-            extracted_slots,
-            node.id,
-        )
+        logger.info("[ToolCallAdapter] tool_call=%s slots=%s node=%s", edge_id, extracted_slots, node.id)
 
         return CriteriaResult(
             node_id=node.id,
@@ -427,6 +626,62 @@ class ToolCallAdapter:
             all_required_met=True,
             extracted_slots=extracted_slots,
         )
+
+    async def _fire_early_response(self, edge_id: str, current_node: "FlowNode") -> None:
+        """Pre-generate and stream response for target node when edge_id is known.
+
+        Only fires for nodes with extractable speech text (0 LLM calls).
+        Complex nodes fall through to generate_reply() as normal.
+        """
+        if not self._edge_id_callback or not self._machine:
+            return
+
+        edge = next((e for e in (current_node.edges or []) if e.id == edge_id), None)
+        if not edge:
+            return
+        target_node = self._machine._node_map.get(edge.target_node_id)
+        if not target_node:
+            return
+
+        # Don't fire early response if target node would be smart-skipped by
+        # _follow_router_chain. Early TTS would play then get orphaned.
+        ctx = self._machine.context
+        _node_had_slots = bool(ctx.node_slots.get(target_node.id))
+        _is_single_edge = len(target_node.edges) == 1
+        if (
+            target_node.id in ctx.completed_nodes
+            and (_is_single_edge or _node_had_slots)
+        ):
+            return
+
+        instruction = target_node.instruction or ""
+        if "{{" in instruction:
+            # Skip early response if any template variable is not yet in userdata.
+            # Slots are stored after _do_transition, not during streaming eval.
+            import re as _re_check
+            needed = set(_re_check.findall(r'\{\{(\w+)\}\}', instruction))
+            current_ud = dict(ctx.userdata) if ctx.userdata else {}
+            if needed - set(current_ud.keys()):
+                return  # Variables not yet available — generate_reply will have them
+            ctx_dict = self._build_context(current_ud)
+            instruction = self._render(instruction, ctx_dict)
+
+        # Extract speech without LLM — try all scripted formats in priority order.
+        # Fires early so TTS starts streaming before generate_reply() is called.
+        pre_text = _extract_agent_says(instruction)
+
+        if not pre_text:
+            lang = _resolve_lang(self._machine) if self._machine else "en"
+            pre_text = _extract_for_language(instruction, lang)
+
+        if not pre_text:
+            return
+
+        # Store so generate_reply() returns it without a second LLM call
+        self._pre_generated_response = pre_text
+
+        # Push tokens through the callback → token_queue → TTS starts immediately
+        await self._edge_id_callback(pre_text)
 
     async def execute_action(
         self,

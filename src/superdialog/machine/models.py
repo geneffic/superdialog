@@ -119,6 +119,9 @@ class ConversationData(BaseModel):
     # Audit trail
     transition_log: list[TransitionRecord] = Field(default_factory=list)
     completed_nodes: set[str] = Field(default_factory=set)
+    # Maps node_id → edge_id that fired on the last completed visit.
+    # Used by smart-skip: re-fire deterministic nodes silently on re-entry.
+    last_fired_edge: dict[str, str] = Field(default_factory=dict)
     # API action audit trail
     action_log: list[ActionRecord] = Field(default_factory=list)
 
@@ -345,6 +348,10 @@ class FlowContext(BaseModel):
     @completed_nodes.setter
     def completed_nodes(self, value: set[str]) -> None:
         self.data.completed_nodes = value
+
+    @property
+    def last_fired_edge(self) -> dict[str, str]:
+        return self.data.last_fired_edge
 
     @property
     def action_results(self) -> dict[str, Any]:

@@ -1661,7 +1661,7 @@ class DialogStateMachine:
         return False
 
     async def _follow_router_chain(
-        self, user_input: str, last_result: TurnResult, max_hops: int = 5
+        self, user_input: str, last_result: TurnResult, max_hops: int = 12
     ) -> TurnResult:
         """After a transition, auto-process nodes that must not block on user input:
 
@@ -1674,13 +1674,80 @@ class DialogStateMachine:
         hops = 0
         accumulated_speech: str = ""
         while not self.is_complete and hops < max_hops:
-            node_type = _classify_node_type(self.current_node)
+            node = self.current_node
+            node_type = _classify_node_type(node)
             is_router = node_type == "router"
-            is_instruction = node_type == "instruction" and bool(self.current_node.edges)
+            is_instruction = node_type == "instruction" and bool(node.edges)
             is_silent = is_instruction and not last_result.response
-            is_auto = is_instruction and _is_auto_proceed(self.current_node)
+            is_auto = is_instruction and _is_auto_proceed(node)
 
-            if not (is_router or is_silent or is_auto):
+            # Data-prefilled check runs FIRST — if any edge's required slots are
+            # already in userdata, is_prefilled wins over smart-skip so we don't
+            # re-fire the old edge (which could loop back to a stale path).
+            is_prefilled = False
+            if is_instruction:
+                for _edge in node.edges:
+                    _schema = _edge.input_schema if isinstance(_edge.input_schema, dict) else None
+                    if _schema:
+                        _required = _schema.get("required", [])
+                        if _required and all(bool(self.context.userdata.get(k)) for k in _required):
+                            is_prefilled = True
+                            break
+
+            # Smart-skip: if this completed node is deterministic, fire its
+            # last edge immediately — discard entry speech so user doesn't
+            # hear a repeated question. Heuristic: single-edge OR had slots.
+            # IMPORTANT: skip only when is_prefilled is False; prefilled data
+            # means the correct next edge may differ from last_fired_edge.
+            node_had_slots = bool(self.context.node_slots.get(node.id))
+            is_single_edge = len(node.edges) == 1
+            logger.info(
+                "[SMART-SKIP-DEBUG] chain node=%s in_completed=%s had_slots=%s(%s) single_edge=%s is_prefilled=%s",
+                node.id,
+                node.id in self.context.completed_nodes,
+                node_had_slots,
+                dict(self.context.node_slots.get(node.id, {})),
+                is_single_edge,
+                is_prefilled,
+            )
+            is_smart_skip = (
+                is_instruction
+                and not is_prefilled
+                and node.id in self.context.completed_nodes
+                and node.id in self.context.last_fired_edge
+                and (is_single_edge or node_had_slots)
+            )
+            if is_smart_skip:
+                # Discard entry speech so repeated question is never heard
+                last_result = last_result.model_copy(update={"response": ""})
+                prev_edge_id = self.context.last_fired_edge[node.id]
+                edge = self._get_edge(prev_edge_id)
+                if edge is not None:
+                    logger.info(
+                        "[traverse] smart-skip-chain hop=%d node=%s edge=%s",
+                        hops, node.id, prev_edge_id,
+                    )
+                    hops += 1
+                    chained = await self._do_transition(
+                        edge_id=prev_edge_id,
+                        edge=edge,
+                        criteria_met={},
+                        skipped=True,
+                        from_node=node.id,
+                    )
+                    last_result = chained
+                    continue
+                # edge lookup failed — fall through to normal path
+
+            # is_prefilled already computed above (before smart-skip check).
+            if is_prefilled:
+                last_result = last_result.model_copy(update={"response": ""})
+                logger.info(
+                    "[traverse] data-prefilled-chain hop=%d node=%s",
+                    hops, node.id,
+                )
+
+            if not (is_router or is_silent or is_auto or is_prefilled):
                 break
 
             # Carry auto_proceed speech before transitioning away from this node
@@ -1781,7 +1848,19 @@ class DialogStateMachine:
         )
         self.context.transition_log.append(record)
         self.context.completed_nodes.add(from_node)
+        self.context.last_fired_edge[from_node] = edge_id
         self.context.current_node_id = self.state
+        # Debug: log node_slots for verification nodes to diagnose smart-skip failures
+        _slots = dict(self.context.node_slots.get(from_node, {}))
+        logger.info(
+            "[SMART-SKIP-DEBUG] %s -[%s]-> %s | node_slots=%s | userdata_keys=%s",
+            from_node, edge_id, self.state,
+            _slots,
+            [k for k in self.context.userdata if k in (
+                "captured_yob", "yob_verified", "captured_last4", "last4_verified",
+                "card_received_via_soft_probe"
+            )],
+        )
         logger.info(
             "[FLOW] transition recorded: %s -> %s, completed_nodes=%s",
             from_node,
