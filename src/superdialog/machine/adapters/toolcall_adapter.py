@@ -64,6 +64,48 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _livekit_inference_url() -> str:
+    """Convert LIVEKIT_URL (wss://) to HTTPS base URL for inference API."""
+    url = os.environ.get("LIVEKIT_INFERENCE_URL") or os.environ.get("LIVEKIT_URL", "")
+    return url.replace("wss://", "https://").replace("ws://", "http://")
+
+
+def _make_openai_client():
+    """Return an AsyncOpenAI client.
+
+    LLM_BACKEND=livekit  → true LiveKit inference (JWT from LIVEKIT_API_KEY+SECRET,
+                            base_url=LIVEKIT_URL). Mirrors how inference.LLM works
+                            internally in livekit_services.py.
+    LLM_BACKEND=openai   → OPENAI_API_KEY + default OpenAI endpoint (default)
+
+    Auto-selects livekit when LIVEKIT_API_KEY + LIVEKIT_API_SECRET are set and
+    LLM_BACKEND is not explicitly configured.
+    """
+    from openai import AsyncOpenAI
+
+    lk_api_key = os.environ.get("LIVEKIT_API_KEY") or os.environ.get("LIVEKIT_INFERENCE_API_KEY")
+    lk_api_secret = os.environ.get("LIVEKIT_API_SECRET") or os.environ.get("LIVEKIT_INFERENCE_API_SECRET")
+
+    backend = os.environ.get(
+        "LLM_BACKEND",
+        "livekit" if (lk_api_key and lk_api_secret) else "openai",
+    )
+
+    if backend == "livekit" and lk_api_key and lk_api_secret:
+        try:
+            from livekit.agents.inference.llm import create_access_token, get_default_inference_url
+            token = create_access_token(lk_api_key, lk_api_secret)
+            # Use the same gateway URL inference.LLM uses — agent-gateway.livekit.cloud/v1
+            # NOT the project LIVEKIT_URL (that's for rooms/WebSocket, not inference HTTP)
+            base_url = get_default_inference_url()
+            logger.debug("[ToolCallAdapter] LLM via LiveKit inference gateway: %s", base_url)
+            return AsyncOpenAI(api_key=token, base_url=base_url)
+        except ImportError:
+            logger.warning("[ToolCallAdapter] livekit-agents not installed — falling back to OpenAI")
+
+    return AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
 def _is_zero_speech_step(rendered_instruction: str) -> bool:
     """Return True if the rendered instruction mandates zero speech at the current step.
 
@@ -87,6 +129,62 @@ def _is_zero_speech_step(rendered_instruction: str) -> bool:
     return found_any
 
 
+_SPEECH_STOP_RE = re.compile(
+    r"<wait for response>|\nROUTING\s*:|\nCapture only",
+    re.IGNORECASE,
+)
+
+
+def _strip_routing_metadata(text: str) -> str:
+    """Strip routing/capture instructions that follow the speech text.
+
+    Nodes embed metadata (ROUTING:, Capture only, <wait for response>)
+    after the speech text inside the same language block. These must not
+    be spoken aloud by TTS.
+    """
+    m = _SPEECH_STOP_RE.search(text)
+    if m:
+        text = text[:m.start()].strip()
+    return text
+
+
+def _extract_first_quoted_speech(text: str) -> str | None:
+    """Extract the first 'speech' or "speech" string at the start of text.
+
+    Universal extractor for flow instructions that embed LLM routing context
+    after the speech text, e.g.:
+
+        'Sure. क्या आप treatment के लिए देख रहे हैं?'
+
+        Per [Non-Negotiable Rules]: do NOT convey therapy duration.
+
+        ROUTING: ...
+
+    The closing quote MUST be at end-of-line (followed by \\n or end-of-string).
+    This handles apostrophes correctly: 'I'll arrange...' does NOT stop at the
+    apostrophe in 'I'll' because that apostrophe is not at end-of-line.
+
+    Returns the inner text WITHOUT outer quotes. Returns None if the text does
+    not start with a quote character.
+    """
+    t = text.strip()
+    if not t or t[0] not in ("'", '"'):
+        return None
+    q = t[0]
+    i = 1
+    while i < len(t):
+        if t[i] == q and (i + 1 >= len(t) or t[i + 1] in ("\n", "\r")):
+            inner = t[1:i].strip()
+            return inner or None
+        i += 1
+    # Fallback: use last occurrence of the quote character
+    last = t.rfind(q, 1)
+    if last > 0:
+        inner = t[1:last].strip()
+        return inner or None
+    return None
+
+
 def _extract_for_language(instruction: str, lang: str) -> str | None:
     """Extract speech text for *lang* from instruction without calling an LLM.
 
@@ -96,6 +194,7 @@ def _extract_for_language(instruction: str, lang: str) -> str | None:
       3. ``--- LANGUAGE SCRIPT --- ... ---`` sections (script-reader format)
 
     Returns the stripped text or None when no match.
+    Routing/metadata after <wait for response> or ROUTING: is stripped.
     """
     if not instruction:
         return None
@@ -104,14 +203,19 @@ def _extract_for_language(instruction: str, lang: str) -> str | None:
     # 1. "XX line: '...'" format
     for m in _LANG_LINE_RE.finditer(instruction):
         if m.group("lang").upper() == target:
-            text = m.group(2).strip()
+            text = _strip_routing_metadata(m.group(2).strip())
             if text:
                 return text
 
     # 2. Block markers [XX] / {XX} (case-insensitive)
     for m in _LANG_BLOCK_CI_RE.finditer(instruction):
         if m.group(1).upper() == target:
-            text = m.group(2).strip()
+            block = m.group(2).strip()
+            # Try quoted-speech extraction first (universal: handles any text
+            # after the closing quote that is not speech — Per [Non-Negotiable
+            # Rules]:, ATTEMPT LIMITS:, PRONUNCIATION:, etc.).
+            # Fall back to strip-based approach for unquoted content.
+            text = _extract_first_quoted_speech(block) or _strip_routing_metadata(block)
             if text:
                 return text
 
@@ -123,6 +227,7 @@ def _extract_for_language(instruction: str, lang: str) -> str | None:
                 text = m.group(2).strip()
                 # Strip trailing "--- END ... ---" line if captured
                 text = re.sub(r"\s*---\s+END\b.*", "", text, flags=re.DOTALL).strip()
+                text = _strip_routing_metadata(text)
                 if text:
                     return text
 
@@ -138,6 +243,7 @@ def _extract_agent_says(instruction: str) -> str | None:
     # Strip (stage directions like this) — not meant for caller
     text = re.sub(r"\s*\([^)]*\)", "", text).strip()
     return text if text else None
+
 
 
 def _strip_provider_prefix(model_id: str) -> str:
@@ -357,13 +463,19 @@ class ToolCallAdapter:
             self.responses.append(agent_says)
             return agent_says
 
+        # Single-language quoted speech without [EN]/[HI] markers.
+        # Handles: 'speech text'\nROUTING: / Per [Non-Negotiable]:  etc.
+        # This is the last zero-LLM-call path before falling back to the LLM.
+        quoted_speech = _extract_first_quoted_speech(rendered_instruction)
+        if quoted_speech:
+            self.responses.append(quoted_speech)
+            return quoted_speech
+
         # Complex instruction — call LLM to generate natural reply
         return await self._generate_via_llm(rendered_instruction, history or [])
 
     async def _generate_via_llm(self, instruction: str, history: list[dict]) -> str:
         """Call LLM to generate entry speech for complex/template instructions."""
-        from openai import AsyncOpenAI
-
         speech_directive = (
             "SPEECH GENERATION MODE: Generate ONLY the agent's natural spoken response. "
             "Do NOT output tool call syntax, JSON objects, function names, routing "
@@ -382,7 +494,14 @@ class ToolCallAdapter:
         ]
         messages.extend(history[-6:])
 
-        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        client = _make_openai_client()
+        _backend = os.environ.get("LLM_BACKEND", "openai")
+        logger.info(
+            "[LLM] backend=%s  endpoint=%s  model=%s",
+            _backend,
+            str(client.base_url),
+            _strip_provider_prefix(self._model_id),
+        )
         _t0 = time.perf_counter()
         try:
             response = await client.chat.completions.create(
@@ -413,8 +532,6 @@ class ToolCallAdapter:
         userdata: dict[str, Any],
     ) -> CriteriaResult:
         """Evaluate via LLM tool-calling (streaming for early edge_id detection)."""
-        from openai import AsyncOpenAI
-
         machine = self._machine
 
         # Build tool schemas from descriptors
@@ -505,15 +622,38 @@ class ToolCallAdapter:
         instructions = f"{_routing_rule}\n\n{instructions}"
 
         _slot_ctx = {k: v for k, v in userdata.items() if k != "_flow_meta" and v not in (None, "")}
-        if _slot_ctx:
-            _slot_lines = "\n".join(f"  {k}: {v}" for k, v in _slot_ctx.items())
+
+        # Also expose template variables referenced in the raw node instruction that
+        # are null/unset — so the LLM can reason about them for silent routing nodes
+        # (e.g. "name_check" routes on {{name}} which may not be in userdata).
+        import re as _re
+        _TVAR_RE = _re.compile(r"\{\{\s*(\w+)\s*\}\}")
+        _raw_instruction = node.instruction or ""
+        _referenced_vars = {m for m in _TVAR_RE.findall(_raw_instruction)}
+        _null_vars = {
+            v: "null"
+            for v in _referenced_vars
+            if v not in _slot_ctx and v not in ("_flow_meta",)
+            and userdata.get(v) in (None, "", [], {})
+        }
+
+        _all_data = {**_slot_ctx, **_null_vars}
+        if _all_data:
+            _slot_lines = "\n".join(f"  {k}: {v}" for k, v in _all_data.items())
             instructions = f"{instructions}\n\n[CURRENT DATA]\n{_slot_lines}"
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": instructions}]
         for msg in history[-10:]:
             messages.append(msg)
 
-        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        client = _make_openai_client()
+        _backend = os.environ.get("LLM_BACKEND", "openai")
+        logger.info(
+            "[LLM] backend=%s  endpoint=%s  model=%s",
+            _backend,
+            str(client.base_url),
+            _strip_provider_prefix(self._model_id),
+        )
         _t0 = time.perf_counter()
         try:
             stream = await client.chat.completions.create(
