@@ -13,10 +13,7 @@ from __future__ import annotations
 
 collect_ignore_glob = [
     # Depend on superdialog.machine.eval.* (not ported)
-    "test_corpus_generator.py",
-    "test_edge_accuracy.py",
     "test_engine_advisor.py",
-    "test_evaluator_surface.py",
     "test_failure_classifier.py",
     "test_flow_optimizer.py",
     "test_graph_analysis.py",
@@ -25,7 +22,6 @@ collect_ignore_glob = [
     # guarded (eval-dependent classes skip when the module is absent), so the
     # file collects and its non-eval tests run.
     "test_rl_loop.py",
-    "test_user_simulator.py",
     # Depends on superdialog.machine.engine (not ported)
     "test_engine_resolver.py",
     # Depends on super.core.voice.schema / lite_v2.state
@@ -41,3 +37,23 @@ collect_ignore_glob = [
     "test_sample_flow.py",
     "test_custom_tool_e2e.py",
 ]
+
+
+import pytest
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--flow",
+        default=None,
+        help="Path to a flow JSON file for real-flow eval tests.",
+    )
+
+
+@pytest.fixture
+def flow_under_test(request: pytest.FixtureRequest):
+    from superdialog.flow.models import ConversationFlow
+    path = request.config.getoption("--flow")
+    if path is None:
+        pytest.skip("pass --flow <path> to run against a real flow")
+    return ConversationFlow.from_json_file(path)
