@@ -315,3 +315,75 @@ def test_build_traversal_actions_per_step():
     assert action["status"] == 200
     assert action["success"] is True
     assert action["result_data"] == {"access_token": "abc123"}
+
+
+def test_build_traversal_prefers_record_messages_on_chained_turns():
+    """One user turn -> two transition records, but only one chat_turns entry.
+    build_traversal must read messages from records, not mis-pair positionally."""
+    from superdialog.machine.models import TransitionRecord
+    from superdialog.traversal import build_traversal
+
+    flow = _make_flow(["a", "r", "c"])
+    log = [
+        TransitionRecord(
+            from_node="a",
+            to_node="r",
+            edge_id="a_to_r",
+            criteria_met={"x": True},
+            user_message="hello",
+            bot_message="",
+            timestamp=1.0,
+        ),
+        TransitionRecord(
+            from_node="r",
+            to_node="c",
+            edge_id="r_to_c",
+            criteria_met={},
+            user_message=None,
+            bot_message="Goodbye!",
+            timestamp=2.0,
+        ),
+    ]
+    machine = _make_fake_machine(
+        [{"id": "a"}, {"id": "r"}, {"id": "c"}],
+        transition_log=log,
+    )
+    # Desync: the chained hop has NO chat_turns entry (the real bug).
+    chat_turns = [
+        {"step": 1, "bot": "Hi", "user": None, "node": "a", "ts": ""},
+        {"step": 2, "bot": "", "user": "hello", "node": "r", "ts": ""},
+    ]
+    started_at = datetime(2026, 6, 8, tzinfo=timezone.utc)
+
+    result = build_traversal(machine, chat_turns, flow, "f.json", "m", started_at)
+
+    step_ar = result["traversal"][1]
+    assert step_ar["user_message"] == "hello"
+    step_rc = result["traversal"][2]  # would be blank under positional pairing
+    assert step_rc["user_message"] is None
+    assert step_rc["bot_message"] == "Goodbye!"
+
+
+def test_build_traversal_met_true_when_no_criteria():
+    """A criteria-free transition that succeeded should report met=True, not the
+    old bool({}) -> False wart."""
+    from superdialog.machine.models import TransitionRecord
+    from superdialog.traversal import build_traversal
+
+    flow = _make_flow(["a", "b"])
+    log = [
+        TransitionRecord(
+            from_node="a",
+            to_node="b",
+            edge_id="a_to_b",
+            criteria_met={},
+            skipped=False,
+            timestamp=1.0,
+        )
+    ]
+    machine = _make_fake_machine([{"id": "a"}, {"id": "b"}], transition_log=log)
+    chat_turns = [{"step": 1, "bot": "Hi", "user": None, "node": "a", "ts": ""}]
+    started_at = datetime(2026, 6, 8, tzinfo=timezone.utc)
+
+    result = build_traversal(machine, chat_turns, flow, "f.json", "m", started_at)
+    assert result["traversal"][1]["criteria"]["met"] is True

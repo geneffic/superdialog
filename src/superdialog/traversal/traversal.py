@@ -109,10 +109,33 @@ def build_traversal(
             "actions": actions_by_node.get(first_node, []),
         })
 
+    # Decide message sourcing ONCE for the whole log. If any record carries
+    # attribution, this is a "new" log -> trust records entirely (robust to
+    # router chaining; a router hop legitimately has bot_message=""). Only a
+    # fully-legacy log (no record carries any message) falls back to the old
+    # positional chat_turns pairing. This avoids re-introducing the mis-pairing
+    # for router hops whose genuine bot_message is "".
+    log_has_attribution = any(
+        (getattr(rec, "user_message", None) is not None)
+        or (getattr(rec, "bot_message", "") or "")
+        for rec in transition_log
+    )
+
     for i, rec in enumerate(transition_log):
         turn = chat_turns[i + 1] if i + 1 < len(chat_turns) else {}
+        if log_has_attribution:
+            bot_message = getattr(rec, "bot_message", "") or ""
+            user_message = getattr(rec, "user_message", None)
+        else:
+            bot_message = turn.get("bot")
+            user_message = turn.get("user")
+        # met is True when criteria all pass OR there were no criteria to gate on
+        # (an empty criteria_met dict means "nothing required", not "failed").
+        met = (not rec.skipped) and (
+            all(rec.criteria_met.values()) if rec.criteria_met else True
+        )
         criteria = {
-            "met": bool(rec.criteria_met) and all(rec.criteria_met.values()) and not rec.skipped,
+            "met": met,
             "skipped": rec.skipped,
             "edge_id": rec.edge_id,
             "criteria_map": dict(rec.criteria_met),
@@ -122,10 +145,14 @@ def build_traversal(
             "from_node": rec.from_node,
             "to_node": rec.to_node,
             "edge_id": rec.edge_id,
-            "timestamp": datetime.fromtimestamp(rec.timestamp, tz=timezone.utc).isoformat(),
-            "node_instruction": node_lookup.get(rec.to_node, {}).get("instruction", ""),
-            "bot_message": turn.get("bot"),
-            "user_message": turn.get("user"),
+            "timestamp": datetime.fromtimestamp(
+                rec.timestamp, tz=timezone.utc
+            ).isoformat(),
+            "node_instruction": node_lookup.get(rec.to_node, {}).get(
+                "instruction", ""
+            ),
+            "bot_message": bot_message,
+            "user_message": user_message,
             "criteria": criteria,
             "actions": actions_by_node.get(rec.to_node, []),
         })
