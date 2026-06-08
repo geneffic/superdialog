@@ -165,13 +165,25 @@ def extract_speech_text(text: str, machine: Any, lang: str) -> str | None:
     matching the original contract (the caller falls back to
     ``generate_reply``). Otherwise delegates to ``select_language_content``
     (``fallback="warn"``) and runs the result through ``render_template``.
+
+    Post-processing: strips everything from ``<wait for response>`` onwards
+    so that routing/capture instructions embedded in the [HI]/[EN] block
+    are never passed to TTS. This matches the Kairali-style flow format
+    where routing metadata follows the speech text inside the same block.
     """
     if not text:
         return None
     if not _LANG_MARKER_RE.search(text):
         return None
     speech = select_language_content(text, lang, fallback="warn")
-    return render_template(speech, machine)
+    # Strip routing/metadata section that follows speech text.
+    # <wait for response> is the canonical boundary between speech and instructions.
+    _STRIP_MARKERS = ("<wait for response>", "\nROUTING:", "\nCapture only")
+    for marker in _STRIP_MARKERS:
+        idx = speech.find(marker)
+        if idx >= 0:
+            speech = speech[:idx].strip()
+    return render_template(speech, machine) if speech else None
 
 
 def normalize_template_vars(text: str) -> str:

@@ -1,6 +1,6 @@
 [project]
 name = "superdialog"
-version = "0.1.0a1"
+version = "0.2.3"
 description = "Standalone dialog state machine framework — text in, text out."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,9 @@ mcp = ["mcp>=0.9"]
 langchain = ["langchain-core>=0.3"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "anyio>=4", "ruff>=0.4", "pyrefly>=0.1"]
 
+[project.urls]
+Homepage = "https://github.com/geneffic/superdialog"
+Repository = "https://github.com/geneffic/superdialog"
 [project.scripts]
 superdialog = "superdialog.cli.main:main"
 
