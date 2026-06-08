@@ -18,7 +18,9 @@ collect_ignore_glob = [
     "test_flow_optimizer.py",
     "test_graph_analysis.py",
     "test_multi_model.py",
-    "test_path_traversal.py",
+    # test_path_traversal.py no longer ignored: its eval imports are now
+    # guarded (eval-dependent classes skip when the module is absent), so the
+    # file collects and its non-eval tests run.
     "test_rl_loop.py",
     # Depends on superdialog.machine.engine (not ported)
     "test_engine_resolver.py",

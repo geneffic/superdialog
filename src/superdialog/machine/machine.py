@@ -1143,6 +1143,7 @@ class DialogStateMachine:
                     criteria_met={},
                     skipped=True,
                     from_node=from_node,
+                    user_message=user_input,
                 )
 
         # 3. Evaluate criteria (with retry on failure)
@@ -1259,6 +1260,7 @@ class DialogStateMachine:
                     criteria_met=result.criteria_met,
                     skipped=not result.all_required_met,
                     from_node=from_node,
+                    user_message=user_input,
                 )
                 # Auto-chain: router nodes must not block on user input
                 return await self._follow_router_chain(user_input, turn_result)
@@ -1379,6 +1381,7 @@ class DialogStateMachine:
                     criteria_met={},
                     skipped=True,
                     from_node=from_node,
+                    user_message=user_input,
                 )
 
         # Merge collected data into node_slots and userdata
@@ -1443,6 +1446,7 @@ class DialogStateMachine:
             criteria_met={},
             skipped=False,
             from_node=from_node,
+            user_message=user_input,
         )
 
     # ------------------------------------------------------------------
@@ -1641,6 +1645,7 @@ class DialogStateMachine:
             criteria_met=result.criteria_met,
             skipped=False,
             from_node=from_node,
+            user_message=None,
         )
 
     def _all_required_slots_present(self, node: FlowNode) -> bool:
@@ -1758,7 +1763,8 @@ class DialogStateMachine:
 
             hops += 1
             reason = (
-                "router" if is_router
+                "router"
+                if is_router
                 else ("auto-proceed" if is_auto else "silent-instruction")
             )
             logger.info(
@@ -1790,6 +1796,7 @@ class DialogStateMachine:
         criteria_met: dict[str, bool],
         skipped: bool,
         from_node: str,
+        user_message: str | None = None,
     ) -> TurnResult:
         """Execute a full transition: actions → trigger → record → response."""
         logger.info(
@@ -1948,6 +1955,11 @@ class DialogStateMachine:
             )
             if self._should_persist_response_to_history():
                 self.context.add_assistant_message(response)
+
+        # Attribute this turn's messages to the record (source of truth for
+        # traversal; robust to router-chaining where one user turn = N records).
+        record.user_message = user_message
+        record.bot_message = response or ""
 
         # 8. End session if final
         if actions_fired:
