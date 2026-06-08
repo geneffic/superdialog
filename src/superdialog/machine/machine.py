@@ -1456,6 +1456,12 @@ class DialogStateMachine:
             logger.info("[FLOW] global edge=%s fired — pushing intent stack", edge_id)
             self._push_intent_stack()
 
+        # NOTE: on this voice/tool-call entry path user_input may be None, so the
+        # stamped record can carry user_message=None as a turn's first record.
+        # build_traversal is only ever driven via DialogMachine.process_turn (it
+        # never consumes records produced here), so the log_has_attribution
+        # heuristic in build_traversal is unaffected. If voice traversals are
+        # ever routed through that builder, revisit the fallback heuristic.
         return await self._do_transition(
             edge_id=edge_id,
             edge=edge,
