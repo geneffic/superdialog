@@ -428,3 +428,33 @@ async def test_linear_flow_traversal_messages_align() -> None:
     assert step2["user_message"] == "yes please"
     assert step2["bot_message"] == "mock reply for c"
     assert tr["is_complete"] is True
+
+
+def test_build_traversal_legacy_log_falls_back_to_chat_turns():
+    """A fully-legacy log (no record carries any message) must fall back to
+    positional chat_turns pairing — the contract log_has_attribution exists to
+    protect. Pins the fallback branch so future drift can't silently break it."""
+    from superdialog.machine.models import TransitionRecord
+    from superdialog.traversal import build_traversal
+
+    flow = _make_flow(["a", "b"])
+    # Bare record: user_message defaults to None, bot_message to "" → the whole
+    # log has no attribution → build_traversal uses chat_turns positionally.
+    log = [
+        TransitionRecord(
+            from_node="a", to_node="b", edge_id="a_to_b",
+            criteria_met={"x": True}, skipped=False, timestamp=1.0,
+        )
+    ]
+    machine = _make_fake_machine([{"id": "a"}, {"id": "b"}], transition_log=log)
+    chat_turns = [
+        {"step": 1, "bot": "Hi", "user": None, "node": "a", "ts": ""},
+        {"step": 2, "bot": "Bye", "user": "ok", "node": "b", "ts": ""},
+    ]
+    started_at = datetime(2026, 6, 8, tzinfo=timezone.utc)
+
+    result = build_traversal(machine, chat_turns, flow, "f.json", "m", started_at)
+
+    step2 = result["traversal"][1]
+    assert step2["user_message"] == "ok"   # sourced from chat_turns[1], not record
+    assert step2["bot_message"] == "Bye"
