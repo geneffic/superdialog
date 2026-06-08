@@ -43,6 +43,12 @@ class TransitionRecord(BaseModel):
     criteria_met: dict[str, bool] = Field(default_factory=dict)
     skipped: bool = False
     timestamp: float = Field(default_factory=time.time)
+    # Message attribution, stamped by _do_transition. user_message is the
+    # caller utterance that triggered THIS transition (None for auto-routed
+    # router/auto-proceed hops); bot_message is the reply generated on entry
+    # to to_node. Defaults keep older persisted logs loadable.
+    user_message: str | None = None
+    bot_message: str = ""
 
 
 class ActionRecord(BaseModel):
@@ -50,7 +56,7 @@ class ActionRecord(BaseModel):
 
     action_id: str
     node_id: str
-    trigger: str          # "on_enter" | "on_exit" | "edge"
+    trigger: str  # "on_enter" | "on_exit" | "edge"
     url: str
     method: str
     status: int

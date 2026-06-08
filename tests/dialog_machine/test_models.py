@@ -82,6 +82,25 @@ class TestTransitionRecord:
         assert restored == record
 
 
+def test_transition_record_carries_messages():
+    from superdialog.machine.models import TransitionRecord
+
+    rec = TransitionRecord(
+        from_node="a",
+        to_node="b",
+        edge_id="a_to_b",
+        user_message="hello there",
+        bot_message="Hi! What can I do?",
+    )
+    assert rec.user_message == "hello there"
+    assert rec.bot_message == "Hi! What can I do?"
+
+    # Defaults keep old call sites valid (back-compat for persisted logs).
+    bare = TransitionRecord(from_node="a", to_node="b", edge_id="a_to_b")
+    assert bare.user_message is None
+    assert bare.bot_message == ""
+
+
 class TestFlowContext:
     """Tests for FlowContext model."""
 
