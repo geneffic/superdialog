@@ -15,9 +15,11 @@ and synthesises every method the dialog machine expects:
 
 from __future__ import annotations
 
+import time
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from jinja2 import BaseLoader, ChainableUndefined, Environment
 
@@ -29,6 +31,19 @@ if TYPE_CHECKING:
     from superdialog.flow.models import CustomAction, FlowNode
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LLMCallData:
+    node_id: str
+    model: str
+    call_type: Literal["routing", "generate_reply"]
+    latency_ms: float
+    tokens_in: int
+    tokens_out: int
+    prompt_messages: list[dict]
+    response_json: dict
+    edge_id: str | None
 
 
 def _coerce_numeric_strings(d: dict, skip_fields: set[str]) -> dict:
@@ -79,6 +94,7 @@ class LLMAdapter:
         # HTTP action execution state
         self._env_vars: dict[str, str] = dict(environment_variables or {})
         self._jinja_env = Environment(loader=BaseLoader(), undefined=ChainableUndefined)
+        self._on_llm_complete: Callable[[LLMCallData], Awaitable[None]] | None = None
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -126,8 +142,24 @@ class LLMAdapter:
         ]
         if history:
             messages.extend(history)
+        t0 = time.perf_counter()
         result = await self._provider.complete(messages)
+        latency_ms = (time.perf_counter() - t0) * 1000
         self.responses.append(result.text)
+        if self._on_llm_complete is not None:
+            await self._on_llm_complete(
+                LLMCallData(
+                    node_id=node.id,
+                    model=getattr(self._provider, "model", "unknown"),
+                    call_type="generate_reply",
+                    latency_ms=latency_ms,
+                    tokens_in=int(result.metadata.get("prompt_tokens", 0) or 0),
+                    tokens_out=int(result.metadata.get("completion_tokens", 0) or 0),
+                    prompt_messages=messages,
+                    response_json={"text": result.text},
+                    edge_id=None,
+                )
+            )
         return result.text
 
     async def evaluate_criteria(
@@ -151,7 +183,20 @@ class LLMAdapter:
             if rendered != node.instruction:
                 eval_node = node.model_copy(update={"instruction": rendered})
 
-        return await self._judge.evaluate(
+        eval_messages = self._judge.build_evaluation_messages(
+            node=node,
+            history=history,
+            userdata=clean_userdata,
+            system_prompt=self._system_prompt,
+            visit_count=meta.get("visit_count", 1),
+            turns_in_node=meta.get("turns_in_node", 0),
+            agent_language=meta.get("agent_language", ""),
+            agent_gender=meta.get("agent_gender", ""),
+            node_slots=meta.get("node_slots"),
+            previously_completed=meta.get("previously_completed", False),
+        )
+        t0 = time.perf_counter()
+        result = await self._judge.evaluate(
             node=eval_node,
             history=history,
             userdata=clean_userdata,
@@ -163,6 +208,29 @@ class LLMAdapter:
             node_slots=meta.get("node_slots"),
             previously_completed=meta.get("previously_completed", False),
         )
+        latency_ms = (time.perf_counter() - t0) * 1000
+        if self._on_llm_complete is not None:
+            await self._on_llm_complete(
+                LLMCallData(
+                    node_id=node.id,
+                    model=getattr(self._provider, "model", "unknown"),
+                    call_type="routing",
+                    latency_ms=latency_ms,
+                    tokens_in=0,
+                    tokens_out=0,
+                    prompt_messages=eval_messages,
+                    response_json={
+                        "criteria_met": result.criteria_met,
+                        "recommended_edge_id": result.recommended_edge_id,
+                        "response": result.response,
+                    },
+                    edge_id=result.recommended_edge_id,
+                )
+            )
+        return result
+
+    def register_llm_callback(self, fn: Any) -> None:
+        self._on_llm_complete = fn
 
     async def generate_recovery(self, node: FlowNode, error: str) -> str:
         """Return a recovery line when criteria evaluation fails."""
