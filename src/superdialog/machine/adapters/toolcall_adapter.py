@@ -17,7 +17,21 @@ import logging
 import os
 import re
 import time
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
+
+@dataclass
+class LLMCallData:
+    node_id: str
+    model: str
+    call_type: Literal["routing", "generate_reply"]
+    latency_ms: float
+    tokens_in: int
+    tokens_out: int
+    prompt_messages: list[dict]
+    response_json: dict
+    edge_id: str | None
+
 
 # ── Language extraction patterns ─────────────────────────────────────────────
 # Handles all common formats so generate_reply() avoids a second LLM call:
@@ -324,6 +338,8 @@ class ToolCallAdapter:
         # Streaming: callback fired with pre-generated text when edge_id is known,
         # allowing TTS to start before criteria evaluation finishes.
         self._edge_id_callback: Any | None = None
+        # Observability: callback fired after each LLM call with token/latency data.
+        self._on_llm_complete: Callable[[LLMCallData], Awaitable[None]] | None = None
         self._pre_generated_response: str | None = None
         # GET-only URL cache: keyed by "METHOD:rendered_url".
         # Prevents duplicate GET calls with identical parameters (e.g. courses-by-city
@@ -472,9 +488,9 @@ class ToolCallAdapter:
             return quoted_speech
 
         # Complex instruction — call LLM to generate natural reply
-        return await self._generate_via_llm(rendered_instruction, history or [])
+        return await self._generate_via_llm(rendered_instruction, history or [], node_id=getattr(node, 'id', ''))
 
-    async def _generate_via_llm(self, instruction: str, history: list[dict]) -> str:
+    async def _generate_via_llm(self, instruction: str, history: list[dict], node_id: str = "") -> str:
         """Call LLM to generate entry speech for complex/template instructions."""
         speech_directive = (
             "SPEECH GENERATION MODE: Generate ONLY the agent's natural spoken response. "
@@ -522,6 +538,18 @@ class ToolCallAdapter:
             f"model={self._model_id}"
         )
         text = response.choices[0].message.content or ""
+        if self._on_llm_complete is not None:
+            await self._on_llm_complete(LLMCallData(
+                node_id=node_id,
+                model=_strip_provider_prefix(self._model_id),
+                call_type="generate_reply",
+                latency_ms=latency_ms,
+                tokens_in=getattr(usage, "prompt_tokens", 0) or 0,
+                tokens_out=getattr(usage, "completion_tokens", 0) or 0,
+                prompt_messages=messages,
+                response_json={"text": text},
+                edge_id=None,
+            ))
         self.responses.append(text)
         return text
 
@@ -708,7 +736,7 @@ class ToolCallAdapter:
                     await self._fire_early_response(function_name, node)
 
                 if choice.finish_reason == "tool_calls":
-                    break
+                    continue  # keep reading — usage chunk arrives after finish_reason
         except Exception as exc:
             logger.error("[ToolCallAdapter] streaming error: %s", exc)
             if not function_name:
@@ -720,6 +748,18 @@ class ToolCallAdapter:
             f"in={prompt_tokens} out={completion_tokens} tok  "
             f"model={self._model_id}"
         )
+        if self._on_llm_complete is not None:
+            await self._on_llm_complete(LLMCallData(
+                node_id=node.id,
+                model=_strip_provider_prefix(self._model_id),
+                call_type="routing",
+                latency_ms=latency_ms,
+                tokens_in=prompt_tokens,
+                tokens_out=completion_tokens,
+                prompt_messages=messages,
+                response_json={"tool_call": function_name, "args": function_args},
+                edge_id=function_name if function_name != "__stay_on_node__" else None,
+            ))
 
         if not function_name:
             logger.info("[ToolCallAdapter] no tool_call returned for node=%s", node.id)
