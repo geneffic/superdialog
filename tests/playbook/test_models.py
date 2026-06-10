@@ -108,3 +108,53 @@ def test_handler_loads_from_yaml() -> None:
     """)
     pb = Playbook.from_yaml(yaml_text)
     assert pb.handlers[0].on == "webhook.payment_captured"
+
+
+def test_middleware_refresh_tool_validated() -> None:
+    yaml_text = MINIMAL_YAML + textwrap.dedent("""
+        middleware: {on_status: 401, refresh_with: ghost_tool}
+    """)
+    with pytest.raises(ValueError, match="ghost_tool"):
+        Playbook.from_yaml(yaml_text)
+
+
+def test_empty_journeys_rejected() -> None:
+    with pytest.raises(ValueError):
+        Playbook(journeys={})
+    with pytest.raises(ValueError):
+        Playbook.from_yaml(
+            textwrap.dedent("""
+                journeys:
+                  booking:
+                    checkpoints: []
+            """)
+        )
+
+
+def test_duplicate_ids_rejected() -> None:
+    dup_checkpoint = MINIMAL_YAML.replace(
+        "- id: close\n        terminal: true",
+        "- id: collect\n        terminal: true",
+    )
+    assert dup_checkpoint != MINIMAL_YAML
+    with pytest.raises(ValueError, match="collect"):
+        Playbook.from_yaml(dup_checkpoint)
+    dup_tool = MINIMAL_YAML.replace(
+        "pipelines:",
+        '  - id: hold_slot\n    method: GET\n    url: "x"\npipelines:',
+    )
+    with pytest.raises(ValueError, match="hold_slot"):
+        Playbook.from_yaml(dup_tool)
+
+
+def test_dotted_journey_name_rejected() -> None:
+    with pytest.raises(ValueError, match=r"a\.b"):
+        Playbook.from_yaml(
+            textwrap.dedent("""
+                journeys:
+                  a.b:
+                    checkpoints:
+                      - id: only
+                        terminal: true
+            """)
+        )

@@ -68,7 +68,7 @@ class Checkpoint(BaseModel):
 
 
 class Journey(BaseModel):
-    checkpoints: list[Checkpoint]
+    checkpoints: list[Checkpoint] = Field(min_length=1)
 
 
 class DispatchEntry(BaseModel):
@@ -144,7 +144,7 @@ class Policies(BaseModel):
 
 class Playbook(BaseModel):
     persona: str = ""
-    journeys: dict[str, Journey]
+    journeys: dict[str, Journey] = Field(min_length=1)
     dispatch: list[DispatchEntry] = Field(default_factory=list)
     tools: list[ToolSpec] = Field(default_factory=list)
     pipelines: list[PipelineSpec] = Field(default_factory=list)
@@ -200,9 +200,33 @@ class Playbook(BaseModel):
     # -- validation ----------------------------------------------------------
     @model_validator(mode="after")
     def _check_references(self) -> "Playbook":
+        def need_unique(seen: set[str], item_id: str, ctx: str) -> None:
+            if item_id in seen:
+                raise ValueError(f"{ctx}: duplicate id {item_id!r}")
+            seen.add(item_id)
+
+        for jname, j in self.journeys.items():
+            if "." in jname:
+                raise ValueError(f"journey name must not contain '.': {jname!r}")
+            cp_seen: set[str] = set()
+            for cp in j.checkpoints:
+                need_unique(cp_seen, cp.id, f"journey {jname!r}")
+        tool_seen: set[str] = set()
+        for t in self.tools:
+            need_unique(tool_seen, t.id, "tools")
+        pipe_seen: set[str] = set()
+        for p in self.pipelines:
+            need_unique(pipe_seen, p.id, "pipelines")
+
         ids = self.checkpoint_ids()
         pipeline_ids = {p.id for p in self.pipelines}
         tool_ids = {t.id for t in self.tools}
+
+        if self.middleware and self.middleware.refresh_with not in tool_ids:
+            raise ValueError(
+                "middleware.refresh_with: unknown tool "
+                f"{self.middleware.refresh_with!r}"
+            )
 
         def need_cp(ref: str, ctx: str) -> None:
             if ref not in ids:
