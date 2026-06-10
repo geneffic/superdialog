@@ -1,0 +1,81 @@
+import textwrap
+
+import pytest
+
+from superdialog.playbook.models import Playbook
+
+MINIMAL_YAML = textwrap.dedent("""
+    persona: "You are a booking assistant."
+    journeys:
+      booking:
+        checkpoints:
+          - id: collect
+            goal: "Have city and date"
+            slots:
+              city: {type: str, required: true, invalidates: [course_id]}
+              date: {type: date, required: true}
+            guidance: "Collect naturally."
+            advance_when:
+              - {when: "details complete", judge: llm, to: booking.confirm,
+                 requires: [city, date]}
+          - id: confirm
+            gate: hard
+            say_verbatim: "Your booking is held."
+            pipeline: confirm_and_hold
+            slots:
+              price: {type: float, authoritative: true}
+            advance_when:
+              - {when: "pipeline.ok", judge: expr, to: booking.close}
+              - {when: "pipeline.failed", judge: expr, to: booking.collect,
+                 set: {error_context: booking_confirm_failed}}
+          - id: close
+            terminal: true
+            outcome: confirmed
+    tools:
+      - id: hold_slot
+        method: POST
+        url: "{{ env.API_BASE_URL }}/slots/hold"
+        store_response_as: hold_result
+        timeout: 30
+    pipelines:
+      - id: confirm_and_hold
+        steps:
+          - tool: hold_slot
+            on: {ok: continue, failed: {retry: 1, on_exhaust: booking.collect}}
+    interrupts:
+      - {id: goodbye, when: "caller says goodbye", judge: llm,
+         to: booking.close, resume: false}
+    policies:
+      silence: {max_prompts: 2, prompts: ["Can you hear me?", "Are you there?"],
+                then: booking.close}
+""")
+
+
+def test_load_yaml_and_address_checkpoints() -> None:
+    pb = Playbook.from_yaml(MINIMAL_YAML)
+    cp = pb.checkpoint("booking.collect")
+    assert cp.slots["city"].invalidates == ["course_id"]
+    assert pb.checkpoint("booking.confirm").gate == "hard"
+    assert pb.initial_checkpoint_id == "booking.collect"
+    assert [r.judge for r in pb.checkpoint("booking.confirm").advance_when] == [
+        "expr",
+        "expr",
+    ]
+
+
+def test_validation_rejects_dangling_rule_target() -> None:
+    bad = MINIMAL_YAML.replace("to: booking.close}", "to: booking.nope}")
+    with pytest.raises(ValueError, match="booking.nope"):
+        Playbook.from_yaml(bad)
+
+
+def test_unknown_pipeline_rejected() -> None:
+    bad = MINIMAL_YAML.replace("pipeline: confirm_and_hold", "pipeline: missing_pipe")
+    with pytest.raises(ValueError, match="missing_pipe"):
+        Playbook.from_yaml(bad)
+
+
+def test_silence_policy_target_validated() -> None:
+    bad = MINIMAL_YAML.replace("then: booking.close", "then: booking.nowhere")
+    with pytest.raises(ValueError, match="booking.nowhere"):
+        Playbook.from_yaml(bad)
