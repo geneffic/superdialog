@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Iterator, Literal, Union
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 
 class _Base(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     version: int = 0  # stamped by EventLog.append; 0 == unstamped
 
 
@@ -119,6 +121,11 @@ class EventLog:
 
     def __init__(self, events: list[Event] | None = None) -> None:
         self.events: list[Event] = list(events or [])
+        versions = [e.version for e in self.events]
+        if versions != list(range(1, len(self.events) + 1)):
+            raise ValueError(
+                f"event versions must be contiguous starting at 1, got {versions}"
+            )
 
     @property
     def version(self) -> int:
