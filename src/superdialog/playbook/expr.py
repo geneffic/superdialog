@@ -14,7 +14,7 @@ from .state import ConversationState
 
 
 class ExprError(ValueError):
-    pass
+    """Raised for invalid, forbidden, or pathological expressions."""
 
 
 _ALLOWED_CALLS = {"len", "first", "last", "pluck", "unique", "min", "max", "any", "all"}
@@ -51,7 +51,8 @@ _HELPERS = {
     "min": min,
     "max": max,
     "any": any,
-    "all": all,
+    # all([]) is None, not True: missing data must never fire a predicate.
+    "all": lambda xs: all(xs) if xs else None,
 }
 
 
@@ -164,9 +165,11 @@ def evaluate(
     None: missing data is falsy, not fatal. ``extra`` injects additional
     namespace entries (e.g. ``pipeline``) supplied by the Director.
     """
+    if len(expr) > 4096:
+        raise ExprError("expression too long")
     try:
         tree = ast.parse(expr, mode="eval")
-    except SyntaxError as exc:
+    except (SyntaxError, RecursionError) as exc:
         raise ExprError(str(exc)) from exc
     _check(tree)
     namespace: dict[str, Any] = {
@@ -185,6 +188,9 @@ def evaluate(
         )
     except ExprError:
         raise
+    except NameError as exc:
+        # Root names are a closed set; an unknown name is an authoring bug.
+        raise ExprError(f"unknown name: {exc}") from exc
     except Exception:
         return None
     return value._data if isinstance(value, _DotDict) else value

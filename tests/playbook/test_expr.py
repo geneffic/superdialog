@@ -72,6 +72,23 @@ def test_pluck_cannot_leak_internals() -> None:
     assert out == ["s1", "s2"]
 
 
+def test_pathological_and_authoring_errors() -> None:
+    s = _state()
+    # Deep attribute chains must fail loudly, not blow the stack.
+    with pytest.raises(ExprError):
+        evaluate("results" + ".a" * 50_000, s)
+    # Length cap rejects oversized expressions outright.
+    with pytest.raises(ExprError):
+        evaluate("x" * 5000, s)
+    # Typo'd root name is an authoring bug, not missing data.
+    with pytest.raises(ExprError):
+        evaluate("resluts.x.ok", s)
+    # all([]) over missing data must not vacuously fire a predicate.
+    assert evaluate("all(pluck(slots.missing, 'ok'))", s) is None
+    # Errors never read True: failed comparison inside `not` -> None.
+    assert evaluate("not (slots.missing > 3)", s) is None
+
+
 def test_unsafe_constructs_rejected() -> None:
     s = _state()
     for bad in (
