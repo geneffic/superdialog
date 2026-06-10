@@ -1,0 +1,118 @@
+"""Render the Talker's view: priority-packed, token-budgeted (design doc §3).
+
+Priority: persona -> guidance -> steering note -> slots -> computed views ->
+recent transcript (newest first) -> summary. Env lane is NEVER rendered.
+Guidance/say_verbatim are Jinja templates over {slots, views, results}.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from jinja2 import Environment, Undefined
+from pydantic import BaseModel, Field
+
+from .expr import ExprError, evaluate
+from .models import Playbook
+from .state import ConversationState
+
+_jinja = Environment(undefined=Undefined, autoescape=False)
+
+
+def estimate_tokens(text: str) -> int:
+    """Cheap token estimate: ~4 chars per token, floor of 1."""
+    return max(1, len(text) // 4)
+
+
+class RenderedView(BaseModel):
+    """The Talker's packed prompt plus the state version it rendered."""
+
+    messages: list[dict[str, str]] = Field(default_factory=list)
+    spoke_from_version: int = 0
+
+
+def template_namespace(pb: Playbook, state: ConversationState) -> dict[str, Any]:
+    """Build the {slots, views, results} namespace for Jinja templates."""
+    views: dict[str, Any] = {}
+    for name, expr in pb.views.items():
+        try:
+            views[name] = evaluate(expr, state)
+        except ExprError:
+            views[name] = None
+    return {
+        "slots": {k: v.value for k, v in state.slots.items()},
+        "views": views,
+        "results": {
+            k: {"ok": r.ok, "status": r.status, "data": r.data, "error": r.error}
+            for k, r in state.tool_results.items()
+        },
+    }
+
+
+def render_template(
+    text: str,
+    pb: Playbook,
+    state: ConversationState,
+    ns: dict[str, Any] | None = None,
+) -> str:
+    """Render a Jinja template over {slots, views, results}.
+
+    ``ns`` accepts a precomputed namespace to avoid re-evaluating views.
+    """
+    namespace = ns if ns is not None else template_namespace(pb, state)
+    return _jinja.from_string(text).render(**namespace)
+
+
+def _system_block(pb: Playbook, state: ConversationState) -> str:
+    ns = template_namespace(pb, state)
+    cp = pb.checkpoint(state.checkpoint_id) if state.checkpoint_id else None
+    parts: list[str] = [pb.persona.strip()]
+    if cp:
+        guidance = render_template(cp.guidance, pb, state, ns=ns)
+        parts.append(f"## Current step: {cp.id}\nGoal: {cp.goal}\n{guidance}".strip())
+        missing = [
+            k for k, s in cp.slots.items() if s.required and k not in state.slots
+        ]
+        if missing:
+            parts.append("Still needed: " + ", ".join(missing))
+        if cp.never_say:
+            parts.append("Never say: " + "; ".join(cp.never_say))
+    if state.steering_note:
+        label = "Correction" if state.steering_kind == "repair" else "Direction"
+        parts.append(f"## {label} from supervisor\n{state.steering_note}")
+    if state.slots:
+        slot_lines = "\n".join(f"- {k}: {v.value}" for k, v in state.slots.items())
+        parts.append("## Known information\n" + slot_lines)
+    view_lines = "\n".join(
+        f"- {k}: {v}" for k, v in ns["views"].items() if v not in (None, [], {})
+    )
+    if view_lines:
+        parts.append("## Reference data\n" + view_lines)
+    if state.summary:
+        parts.append("## Earlier in this conversation\n" + state.summary)
+    parts.append(
+        "Only state facts present in Known information or Reference data; "
+        "if asked something not there, say you are checking."
+    )
+    return "\n\n".join(p for p in parts if p)
+
+
+def render_view(
+    pb: Playbook, state: ConversationState, token_budget: int = 4000
+) -> RenderedView:
+    """Pack the Talker's view into ``token_budget`` estimated tokens."""
+    system = _system_block(pb, state)
+    used = estimate_tokens(system)
+    chat: list[dict[str, str]] = []
+    # newest-first packing of transcript, then reverse to chronological
+    for entry in reversed(state.transcript):
+        cost = estimate_tokens(entry.text) + 4
+        if used + cost > token_budget:
+            break
+        chat.append({"role": entry.role, "content": entry.text})
+        used += cost
+    chat.reverse()
+    return RenderedView(
+        messages=[{"role": "system", "content": system}, *chat],
+        spoke_from_version=state.version,
+    )

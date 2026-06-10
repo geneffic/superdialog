@@ -1,0 +1,96 @@
+import textwrap
+
+from superdialog.playbook.events import (
+    AdvanceEvent,
+    EventLog,
+    SlotWriteEvent,
+    SteeringNoteEvent,
+    SummaryEvent,
+    ToolResultEvent,
+    UtteranceEvent,
+)
+from superdialog.playbook.models import Playbook
+from superdialog.playbook.render import render_view
+from superdialog.playbook.state import ConversationState
+from tests.playbook.test_models import MINIMAL_YAML
+
+
+def _setup() -> tuple[Playbook, ConversationState]:
+    pb = Playbook.from_yaml(MINIMAL_YAML)
+    log = EventLog()
+    log.append(
+        AdvanceEvent(from_checkpoint=None, to_checkpoint="booking.collect", rule="init")
+    )
+    log.append(SummaryEvent(text="Caller is a returning member."))
+    log.append(SteeringNoteEvent(text="Don't re-ask the city.", kind="steer"))
+    log.append(
+        SlotWriteEvent(key="city", value="Pune", status="confirmed", by="director")
+    )
+    for i in range(30):
+        log.append(UtteranceEvent(role="user", text=f"user line {i}"))
+        log.append(UtteranceEvent(role="assistant", text=f"agent line {i}"))
+    return pb, ConversationState.fold(log, playbook=pb)
+
+
+def test_view_contains_priority_sections() -> None:
+    pb, state = _setup()
+    view = render_view(pb, state, token_budget=10_000)
+    system = view.messages[0]["content"]
+    assert "booking assistant" in system  # persona
+    assert "Collect naturally." in system  # guidance
+    assert "Don't re-ask the city." in system  # steering note
+    assert "city: Pune" in system  # slots
+    assert view.spoke_from_version == state.version
+
+
+def test_budget_drops_old_transcript_before_guidance() -> None:
+    pb, state = _setup()
+    view = render_view(pb, state, token_budget=300)
+    system = view.messages[0]["content"]
+    assert "Collect naturally." in system  # guidance survives
+    texts = [m["content"] for m in view.messages[1:]]
+    assert any("line 29" in t for t in texts)  # newest turns survive
+    assert not any("line 0" in t for t in texts)  # oldest dropped
+    assert "returning member" in system  # summary survives
+
+
+def test_env_never_rendered() -> None:
+    pb, state = _setup()
+    state.env["ACCESS_TOKEN"] = "secret-xyz"
+    view = render_view(pb, state, token_budget=10_000)
+    joined = " ".join(m["content"] for m in view.messages)
+    assert "secret-xyz" not in joined
+
+
+def test_guidance_is_jinja_rendered_with_views() -> None:
+    yaml_text = textwrap.dedent("""
+        persona: "Assistant."
+        views:
+          slot_times: "pluck(results.availability_result.data.slots, 'time')"
+        journeys:
+          j:
+            checkpoints:
+              - id: present
+                guidance: "Offer one of {{ views.slot_times }} to {{ slots.name }}."
+    """)
+    pb = Playbook.from_yaml(yaml_text)
+    log = EventLog()
+    log.append(
+        AdvanceEvent(from_checkpoint=None, to_checkpoint="j.present", rule="init")
+    )
+    log.append(
+        SlotWriteEvent(key="name", value="Ravi", status="confirmed", by="director")
+    )
+    log.append(
+        ToolResultEvent(
+            tool="avail",
+            store_as="availability_result",
+            ok=True,
+            data={"slots": [{"time": "09:00"}, {"time": "10:00"}]},
+        )
+    )
+    state = ConversationState.fold(log)
+    view = render_view(pb, state, token_budget=10_000)
+    system = view.messages[0]["content"]
+    assert "09:00" in system and "Ravi" in system
+    assert "{{" not in system
