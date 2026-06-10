@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Awaitable, Callable, Protocol
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from jinja2 import TemplateError, Undefined
 from jinja2.sandbox import SandboxedEnvironment
@@ -52,14 +53,36 @@ def _render(template: str, ns: dict[str, Any]) -> str:
     return _jinja.from_string(template).render(**ns)
 
 
-_SECRET_KEY_RE = re.compile(r"secret|token|password|api_key|apikey", re.IGNORECASE)
+_SECRET_KEY_RE = re.compile(
+    r"secret|token|password|passwd|api[_-]?key|auth|credential|bearer|jwt"
+    r"|signature|private[_-]?key|access[_-]?key|otp|pin",
+    re.IGNORECASE,
+)
 
 
-def _redact(body: dict[str, Any] | None) -> dict[str, Any]:
-    """Mask secret-like body keys before recording them in the event log."""
-    if not body:
-        return {}
-    return {k: ("***" if _SECRET_KEY_RE.search(k) else v) for k, v in body.items()}
+def _redact(value: Any, key: str | None = None) -> Any:
+    """Mask secret-like keys (recursively) before event-log recording."""
+    if key is not None and _SECRET_KEY_RE.search(key):
+        return "***"
+    if isinstance(value, dict):
+        return {k: _redact(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
+def _redact_url(url: str) -> str:
+    """Strip userinfo and mask secret-like query params before recording."""
+    parts = urlsplit(url)
+    netloc = parts.netloc.rsplit("@", 1)[-1]  # drop user:pass@ if present
+    query = urlencode(
+        [
+            (k, "***" if _SECRET_KEY_RE.search(k) else v)
+            for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        ],
+        safe="*",  # keep the mask literal, not %2A%2A%2A
+    )
+    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
 
 
 def _dig(data: Any, path: str) -> Any:
@@ -173,11 +196,15 @@ class ToolExecutor:
                     error=f"template error: {exc}",
                 ),
             ]
-        # Record a redacted body in the event log; the real body still goes to
-        # http. EnvWriteEvent values stay raw: env is never rendered to the
-        # Talker, and export-time redaction is a later-task concern.
+        # Record a redacted url/body in the event log; the real url and body
+        # still go to http. EnvWriteEvent values stay raw: env is never
+        # rendered to the Talker, and export-time redaction is a later-task
+        # concern.
         events.append(
-            ToolCallEvent(tool=spec.id, args={"url": url, "body": _redact(body)})
+            ToolCallEvent(
+                tool=spec.id,
+                args={"url": _redact_url(url), "body": _redact(body or {})},
+            )
         )
         try:
             status, data = await self._http(

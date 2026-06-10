@@ -222,5 +222,50 @@ async def test_secret_body_keys_redacted() -> None:
     assert http.calls[0]["body"]["client_secret"] == "s3cr3t"  # real body sent
 
 
+async def test_redaction_recursive_and_broad() -> None:
+    spec = ToolSpec(
+        id="nested",
+        method="POST",
+        url="{{ env.API_BASE_URL }}/nested",
+        body={"auth": {"client_secret": "s"}, "items": [{"jwt": "x", "city": "Pune"}]},
+        store_response_as="nested_result",
+    )
+    http = FakeHttp([(200, {})])
+    ex = ToolExecutor(http=http)
+    events = await ex.execute(spec, _state())
+    call = events[0]
+    assert isinstance(call, ToolCallEvent)
+    assert call.args["body"]["auth"] == "***"  # broad denylist: auth masked
+    assert call.args["body"]["items"][0]["jwt"] == "***"  # recursed into list
+    assert call.args["body"]["items"][0]["city"] == "Pune"  # non-secret intact
+    assert http.calls[0]["body"] == {  # real body sent unmasked
+        "auth": {"client_secret": "s"},
+        "items": [{"jwt": "x", "city": "Pune"}],
+    }
+
+
+async def test_url_redaction() -> None:
+    spec = ToolSpec(
+        id="geo",
+        method="GET",
+        url="https://u:p@api.test/x?api_key={{ env.K }}&city=pune",
+        store_response_as="geo_result",
+    )
+    state = _state()
+    state.env["K"] = "sek"
+    http = FakeHttp([(200, {})])
+    ex = ToolExecutor(http=http)
+    events = await ex.execute(spec, state)
+    call = events[0]
+    assert isinstance(call, ToolCallEvent)
+    recorded = call.args["url"]
+    assert "u:p@" not in recorded  # userinfo stripped
+    assert "sek" not in recorded
+    assert "api_key=***" in recorded  # secret param masked, key kept
+    assert "city=pune" in recorded  # non-secret param intact
+    # the REAL url (userinfo + secrets) still went to http
+    assert http.calls[0]["url"] == "https://u:p@api.test/x?api_key=sek&city=pune"
+
+
 def test_bool_coercion_false() -> None:
     assert coerce_args({"f": "false"}, {"f": SlotSpec(type="bool")})["f"] is False
