@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from jinja2 import Environment, Undefined
+from jinja2 import Environment, TemplateError, Undefined
 from pydantic import BaseModel, Field
 
 from .expr import ExprError, evaluate
@@ -36,7 +36,11 @@ def template_namespace(pb: Playbook, state: ConversationState) -> dict[str, Any]
     views: dict[str, Any] = {}
     for name, expr in pb.views.items():
         try:
-            views[name] = evaluate(expr, state)
+            # env is never renderer-visible: shadow it so a view expr like
+            # "env.ACCESS_TOKEN" evaluates to None and is dropped by the
+            # Reference-data filter. Tool when:/url templates (Director-side)
+            # still access env legitimately.
+            views[name] = evaluate(expr, state, extra={"env": None})
         except ExprError:
             views[name] = None
     return {
@@ -60,7 +64,13 @@ def render_template(
     ``ns`` accepts a precomputed namespace to avoid re-evaluating views.
     """
     namespace = ns if ns is not None else template_namespace(pb, state)
-    return _jinja.from_string(text).render(**namespace)
+    try:
+        return _jinja.from_string(text).render(**namespace)
+    except TemplateError:
+        # An authoring typo (undefined name, broken syntax) must never crash
+        # the speaking path: degrade to the raw text, which surfaces the
+        # un-rendered template in transcripts as the debugging signal.
+        return text
 
 
 def _system_block(pb: Playbook, state: ConversationState) -> str:

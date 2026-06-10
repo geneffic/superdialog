@@ -62,6 +62,40 @@ def test_env_never_rendered() -> None:
     assert "secret-xyz" not in joined
 
 
+def test_views_cannot_leak_env() -> None:
+    yaml_text = textwrap.dedent("""
+        persona: "Assistant."
+        views:
+          tok: "env.ACCESS_TOKEN"
+        journeys:
+          j:
+            checkpoints:
+              - id: start
+                guidance: "Greet."
+    """)
+    pb = Playbook.from_yaml(yaml_text)
+    log = EventLog()
+    log.append(AdvanceEvent(from_checkpoint=None, to_checkpoint="j.start", rule="init"))
+    state = ConversationState.fold(log)
+    state.env["ACCESS_TOKEN"] = "secret-xyz"
+    view = render_view(pb, state, token_budget=10_000)
+    joined = " ".join(m["content"] for m in view.messages)
+    assert "secret-xyz" not in joined
+
+
+def test_template_errors_degrade_to_raw_text() -> None:
+    pb, state = _setup()
+    cp = pb.checkpoint("booking.collect")
+
+    cp.guidance = "Hi {{ env.X }}"  # UndefinedError: env is not in the namespace
+    view = render_view(pb, state, token_budget=10_000)
+    assert "{{ env.X }}" in view.messages[0]["content"]
+
+    cp.guidance = "broken {{ slots."  # TemplateSyntaxError
+    view = render_view(pb, state, token_budget=10_000)
+    assert "broken {{ slots." in view.messages[0]["content"]
+
+
 def test_guidance_is_jinja_rendered_with_views() -> None:
     yaml_text = textwrap.dedent("""
         persona: "Assistant."
