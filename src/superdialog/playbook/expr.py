@@ -29,9 +29,9 @@ def _last(xs: Any) -> Any:
 
 
 def _pluck(xs: Any, key: str) -> list[Any]:
-    return [
-        x.get(key) if isinstance(x, dict) else getattr(x, key, None) for x in (xs or [])
-    ]
+    if isinstance(key, str) and key.startswith("_"):
+        raise ExprError(f"forbidden attribute {key!r}")
+    return [x.get(key) if isinstance(x, dict) else None for x in (xs or [])]
 
 
 def _unique(xs: Any) -> list[Any]:

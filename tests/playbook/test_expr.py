@@ -58,6 +58,20 @@ def test_views_pipe_helpers() -> None:
     assert evaluate("first(results.availability_result.data.slots).id", s) == "s1"
 
 
+def test_pluck_cannot_leak_internals() -> None:
+    s = _state()
+    # Underscore keys are rejected outright, even as string constants.
+    with pytest.raises(ExprError):
+        evaluate("pluck([slots], '_state')", s)
+    with pytest.raises(ExprError):
+        evaluate("pluck([results], '__class__')", s)
+    # Non-dict elements pluck to None (no getattr fallback).
+    assert evaluate("pluck([5, 'x'], 'id')", s) == [None, None]
+    # Normal dict plucking still works.
+    out = evaluate("pluck(results.availability_result.data.slots, 'id')", s)
+    assert out == ["s1", "s2"]
+
+
 def test_unsafe_constructs_rejected() -> None:
     s = _state()
     for bad in (
