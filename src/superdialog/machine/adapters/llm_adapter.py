@@ -167,6 +167,7 @@ class LLMAdapter:
         node: FlowNode,
         history: list[dict[str, Any]],
         userdata: dict[str, Any],
+        silent: bool = False,
     ) -> CriteriaResult:
         """Delegate criteria evaluation to :class:`CriteriaJudge`."""
         meta = userdata.get("_flow_meta", {})

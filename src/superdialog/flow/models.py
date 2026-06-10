@@ -168,6 +168,11 @@ class Edge(BaseModel):
     actions: list[ActionTrigger] = Field(default_factory=list)
     criteria: list[CompletionCriterion] | None = None
     is_fallback: bool = False
+    # Optional machine-evaluable Jinja boolean. When set, the router can decide
+    # this edge purely from data (zero LLM) — used for silent/auto-proceed
+    # routers whose prose `condition` the deterministic parser can't read.
+    # e.g. "hold_result.success == true and hold_result.data.status == 'active'".
+    guard: str | None = None
 
     @field_validator("input_schema", mode="before")
     @classmethod
@@ -435,6 +440,10 @@ class ConversationFlow(BaseModel):
                 is_fallback = edge.get("isFallback")
             if is_fallback is not None:
                 normalized_edge["is_fallback"] = is_fallback
+
+            guard = edge_data.get("guard") or edge.get("guard")
+            if guard is not None:
+                normalized_edge["guard"] = guard
 
             edges_by_source.setdefault(source, []).append(normalized_edge)
 

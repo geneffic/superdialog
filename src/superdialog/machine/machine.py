@@ -1612,6 +1612,24 @@ class DialogStateMachine:
         _full_history = self.context.conversation_history
         chain_history = _full_history[-6:] if len(_full_history) > 6 else _full_history
 
+        # Deterministic short-circuit: if the data unambiguously settles which
+        # edge fires (e.g. `booking_confirm_result.success is true`), take it
+        # without the LLM. Silent routers are otherwise routed by an LLM that
+        # intermittently calls __stay_on_node__ when the trailing turn looks
+        # unrelated to the (silent) node — stalling the chain. Data wins here.
+        det_route = getattr(self._adapter, "deterministic_route", None)
+        if det_route is not None:
+            det_edge_id = det_route(current, eval_userdata)
+            if det_edge_id:
+                logger.info(
+                    "[traverse] router node=%s routed deterministically -> %s (0 LLM)",
+                    from_node,
+                    det_edge_id,
+                )
+                return await self._fire_router_transition(
+                    det_edge_id, from_node, criteria_met={}, extracted_slots={}
+                )
+
         result: CriteriaResult | None = None
         for attempt in range(2):
             try:
@@ -1619,6 +1637,7 @@ class DialogStateMachine:
                     current,
                     chain_history,
                     eval_userdata,
+                    silent=True,
                 )
             except Exception:
                 logger.error(
@@ -1640,13 +1659,27 @@ class DialogStateMachine:
         if result is None or not result.recommended_edge_id:
             return None
 
-        if result.extracted_slots:
-            self.context.node_slots.setdefault(self.state, {}).update(
-                result.extracted_slots
-            )
-            self.context.userdata.update(result.extracted_slots)
+        return await self._fire_router_transition(
+            result.recommended_edge_id,
+            from_node,
+            criteria_met=result.criteria_met,
+            extracted_slots=result.extracted_slots,
+        )
 
-        edge_id = result.recommended_edge_id
+    async def _fire_router_transition(
+        self,
+        edge_id: str,
+        from_node: str,
+        *,
+        criteria_met: dict[str, bool],
+        extracted_slots: dict[str, Any] | None,
+    ) -> TurnResult | None:
+        """Validate a router edge id and fire it. Shared by the deterministic
+        and LLM routing paths in _evaluate_router."""
+        if extracted_slots:
+            self.context.node_slots.setdefault(self.state, {}).update(extracted_slots)
+            self.context.userdata.update(extracted_slots)
+
         available_triggers = self._machine.get_triggers(self.state)
         if edge_id not in available_triggers:
             resolved = self._resolve_target_to_edge(edge_id)
@@ -1664,7 +1697,7 @@ class DialogStateMachine:
         return await self._do_transition(
             edge_id=edge_id,
             edge=edge,
-            criteria_met=result.criteria_met,
+            criteria_met=criteria_met,
             skipped=False,
             from_node=from_node,
             user_message=None,
@@ -1679,6 +1712,9 @@ class DialogStateMachine:
         when course/date/time/players were passed in via extracted_slots).
         """
         for edge in node.edges:
+            # Self-loop edges never represent forward progress (see _follow_router_chain).
+            if edge.target_node_id == node.id:
+                continue
             schema = edge.input_schema
             if not isinstance(schema, dict):
                 continue
@@ -1700,8 +1736,22 @@ class DialogStateMachine:
         """
         hops = 0
         accumulated_speech: str = ""
+        # Nodes already auto-advanced through in THIS chain. Re-entering one means
+        # an A→B→A cycle (e.g. collect_booking_details ⇄ ask_course_preference when
+        # the discriminating slot is still missing). MAX_SELF_LOOPS only catches
+        # A→A, so without this the chain bounces until max_hops, burning ~2 LLM
+        # calls per wasted hop. Stop at the re-entry and let the node speak/wait.
+        visited_chain_nodes: set[str] = set()
         while not self.is_complete and hops < max_hops:
             node = self.current_node
+            if node.id in visited_chain_nodes:
+                logger.info(
+                    "[traverse] chain cycle detected — re-entering node=%s "
+                    "(visited=%s) — stopping chain",
+                    node.id,
+                    sorted(visited_chain_nodes),
+                )
+                break
             # Self-loop ceiling: if MAX_SELF_LOOPS consecutive self-transitions
             # have fired, stop auto-chaining. Mirrors the process_turn guard so
             # smart-skip / router hops can't loop a single node unbounded. The
@@ -1728,6 +1778,12 @@ class DialogStateMachine:
             is_prefilled = False
             if is_instruction:
                 for _edge in node.edges:
+                    # Self-loop edges (e.g. list_refresh_city → list_courses_in_city,
+                    # required=[city]) are always "satisfied" by ambient data and would
+                    # make a presentation/collection node look data-ready, barreling past
+                    # its wait point. They never represent forward progress — skip them.
+                    if _edge.target_node_id == node.id:
+                        continue
                     _schema = _edge.input_schema if isinstance(_edge.input_schema, dict) else None
                     if _schema:
                         _required = _schema.get("required", [])
@@ -1768,6 +1824,7 @@ class DialogStateMachine:
                         "[traverse] smart-skip-chain hop=%d node=%s edge=%s",
                         hops, node.id, prev_edge_id,
                     )
+                    visited_chain_nodes.add(node.id)
                     hops += 1
                     chained = await self._do_transition(
                         edge_id=prev_edge_id,
@@ -1797,6 +1854,8 @@ class DialogStateMachine:
                     accumulated_speech + " " + last_result.response
                 ).strip()
 
+            # Mark this node before hopping — re-entry next iteration = cycle.
+            visited_chain_nodes.add(node.id)
             hops += 1
             reason = (
                 "router"

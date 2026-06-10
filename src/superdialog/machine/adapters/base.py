@@ -32,6 +32,7 @@ class RuntimeAdapter(Protocol):
         node: FlowNode,
         history: list[dict[str, Any]],
         userdata: dict[str, Any],
+        silent: bool = False,
     ) -> CriteriaResult: ...
 
     async def execute_action(
