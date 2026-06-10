@@ -2,7 +2,7 @@ import textwrap
 
 import pytest
 
-from superdialog.playbook.models import Playbook
+from superdialog.playbook.models import Playbook, RetrySpec
 
 MINIMAL_YAML = textwrap.dedent("""
     persona: "You are a booking assistant."
@@ -79,3 +79,32 @@ def test_silence_policy_target_validated() -> None:
     bad = MINIMAL_YAML.replace("then: booking.close", "then: booking.nowhere")
     with pytest.raises(ValueError, match="booking.nowhere"):
         Playbook.from_yaml(bad)
+
+
+def test_pipeline_on_block_survives_yaml() -> None:
+    pb = Playbook.from_yaml(MINIMAL_YAML)
+    step = pb.pipeline("confirm_and_hold").steps[0]
+    assert step.on["ok"] == "continue"
+    failed = step.on["failed"]
+    assert isinstance(failed, RetrySpec)
+    assert failed.retry == 1
+    assert failed.on_exhaust == "booking.collect"
+    # booleans must still resolve as booleans
+    assert pb.checkpoint("booking.collect").slots["city"].required is True
+
+
+def test_dangling_on_exhaust_rejected_from_yaml() -> None:
+    bad = MINIMAL_YAML.replace(
+        "on_exhaust: booking.collect", "on_exhaust: booking.ghost"
+    )
+    with pytest.raises(ValueError, match="booking.ghost"):
+        Playbook.from_yaml(bad)
+
+
+def test_handler_loads_from_yaml() -> None:
+    yaml_text = MINIMAL_YAML + textwrap.dedent("""
+        handlers:
+          - {id: h1, on: webhook.payment_captured, pipeline: confirm_and_hold}
+    """)
+    pb = Playbook.from_yaml(yaml_text)
+    assert pb.handlers[0].on == "webhook.payment_captured"

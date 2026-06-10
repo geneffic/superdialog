@@ -3,10 +3,26 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Literal, Union
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
+
+
+class _YamlLoader(yaml.SafeLoader):
+    """YAML 1.2-style booleans: only true/false; on/off/yes/no stay strings."""
+
+
+_YamlLoader.yaml_implicit_resolvers = {
+    key: [(tag, regexp) for tag, regexp in resolvers if tag != "tag:yaml.org,2002:bool"]
+    for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_YamlLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+    list("tTfF"),
+)
 
 
 class SlotSpec(BaseModel):
@@ -230,7 +246,7 @@ class Playbook(BaseModel):
     # -- io -------------------------------------------------------------------
     @classmethod
     def from_yaml(cls, text: str) -> "Playbook":
-        return cls.model_validate(yaml.safe_load(text))
+        return cls.model_validate(yaml.load(text, Loader=_YamlLoader))
 
     @classmethod
     def from_json(cls, text: str) -> "Playbook":
