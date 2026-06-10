@@ -42,7 +42,7 @@ class LLMCallData:
 #   EN line: '...' / HI line: '...'  — line format used in new BOB flows
 
 _LANG_LINE_RE = re.compile(
-    r"(?:^|\n)\s*(?P<lang>[A-Za-z]{2})\s+line\s*:\s*['\"](.+?)['\"]",
+    r"(?:^|\n)\s*(?P<lang>[A-Za-z]{2})\s+line\s*:\s*['\"](.+)['\"][ \t]*$",
     re.MULTILINE,
 )
 
@@ -218,6 +218,8 @@ def _extract_for_language(instruction: str, lang: str) -> str | None:
     for m in _LANG_LINE_RE.finditer(instruction):
         if m.group("lang").upper() == target:
             text = _strip_routing_metadata(m.group(2).strip())
+            # Unescape doubled single-quotes (flow JSON escapes ' as '' inside '...')
+            text = text.replace("''", "'")
             if text:
                 return text
 
