@@ -1,7 +1,12 @@
-from superdialog.playbook.events import EventLog, SlotWriteEvent, ToolResultEvent
+from superdialog.playbook.events import (
+    EventLog,
+    SlotWriteEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+)
 from superdialog.playbook.models import SlotSpec, ToolSpec
 from superdialog.playbook.state import ConversationState
-from superdialog.playbook.toolexec import ToolExecutor
+from superdialog.playbook.toolexec import ToolExecutor, coerce_args
 
 
 class FakeHttp:
@@ -145,3 +150,77 @@ async def test_python_tool_and_arg_coercion() -> None:
     result2 = events2[1]
     assert isinstance(result2, ToolResultEvent) and result2.ok is False
     assert "exploded" in (result2.error or "")
+
+
+async def test_unregistered_python_tool_degrades() -> None:
+    spec = ToolSpec(id="ghost", type="python", store_response_as="ghost_result")
+    ex = ToolExecutor(http=FakeHttp([]))  # no python tools registered
+    events = await ex.execute(spec, _state())
+    kinds = [type(e).__name__ for e in events]
+    assert kinds == ["ToolCallEvent", "ToolResultEvent"]
+    result = events[1]
+    assert isinstance(result, ToolResultEvent) and result.ok is False
+    assert "not registered" in (result.error or "")
+    assert result.store_as == "ghost_result"
+
+
+async def test_error_strings_carry_type() -> None:
+    async def slow_fn(args: dict, state: ConversationState) -> dict:
+        raise TimeoutError()  # str(exc) would be ""
+
+    spec = ToolSpec(id="slow", type="python", store_response_as="slow_result")
+    ex = ToolExecutor(http=FakeHttp([]), python_tools={"slow": slow_fn})
+    events = await ex.execute(spec, _state())
+    result = events[1]
+    assert isinstance(result, ToolResultEvent) and result.ok is False
+    assert (result.error or "").startswith("TimeoutError")
+
+
+async def test_coercion_failure_shape() -> None:
+    spec = ToolSpec(
+        id="score",
+        type="python",
+        store_response_as="score_result",
+        args={"n": SlotSpec(type="int")},
+    )
+    ex = ToolExecutor(http=FakeHttp([]))
+    events = await ex.execute(spec, _state(), args={"n": "7.5"})
+    kinds = [type(e).__name__ for e in events]
+    assert kinds == ["ToolCallEvent", "ToolResultEvent"]
+    result = events[1]
+    assert isinstance(result, ToolResultEvent)
+    assert result.ok is False and result.status is None
+    assert (result.error or "").startswith("bad args")
+
+
+async def test_env_update_missing_path_skipped() -> None:
+    # env_updates wants data.hold_id, but the response has no hold_id.
+    http = FakeHttp([(200, {"data": {}})])
+    ex = ToolExecutor(http=http)
+    events = await ex.execute(HOLD, _state(slot_id="s1", players=2))
+    kinds = [type(e).__name__ for e in events]
+    assert kinds == ["ToolCallEvent", "ToolResultEvent"]  # no EnvWriteEvent
+
+
+async def test_secret_body_keys_redacted() -> None:
+    spec = ToolSpec(
+        id="auth",
+        method="POST",
+        url="{{ env.API_BASE_URL }}/auth",
+        body={"client_secret": "{{ env.CS }}", "city": "x"},
+        store_response_as="auth_result",
+    )
+    state = _state()
+    state.env["CS"] = "s3cr3t"
+    http = FakeHttp([(200, {})])
+    ex = ToolExecutor(http=http)
+    events = await ex.execute(spec, state)
+    call = events[0]
+    assert isinstance(call, ToolCallEvent)
+    assert call.args["body"]["client_secret"] == "***"  # event log masked
+    assert call.args["body"]["city"] == "x"  # non-secret keys intact
+    assert http.calls[0]["body"]["client_secret"] == "s3cr3t"  # real body sent
+
+
+def test_bool_coercion_false() -> None:
+    assert coerce_args({"f": "false"}, {"f": SlotSpec(type="bool")})["f"] is False

@@ -8,6 +8,7 @@ sandboxed and template errors degrade to a failed ToolResultEvent.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Awaitable, Callable, Protocol
 
 from jinja2 import TemplateError, Undefined
@@ -49,6 +50,16 @@ def _template_ns(state: ConversationState) -> dict[str, Any]:
 
 def _render(template: str, ns: dict[str, Any]) -> str:
     return _jinja.from_string(template).render(**ns)
+
+
+_SECRET_KEY_RE = re.compile(r"secret|token|password|api_key|apikey", re.IGNORECASE)
+
+
+def _redact(body: dict[str, Any] | None) -> dict[str, Any]:
+    """Mask secret-like body keys before recording them in the event log."""
+    if not body:
+        return {}
+    return {k: ("***" if _SECRET_KEY_RE.search(k) else v) for k, v in body.items()}
 
 
 def _dig(data: Any, path: str) -> Any:
@@ -110,7 +121,17 @@ class ToolExecutor:
         ns = _template_ns(state)
         events: list[Event] = []
         if spec.type == "python":
-            fn = self._python_tools[spec.id]
+            fn = self._python_tools.get(spec.id)
+            if fn is None:
+                return [
+                    ToolCallEvent(tool=spec.id, args=args or {}),
+                    ToolResultEvent(
+                        tool=spec.id,
+                        store_as=spec.store_response_as,
+                        ok=False,
+                        error=f"python tool not registered: {spec.id}",
+                    ),
+                ]
             events.append(ToolCallEvent(tool=spec.id, args=args or {}))
             try:
                 data = await fn(args or {}, state)
@@ -128,7 +149,7 @@ class ToolExecutor:
                         tool=spec.id,
                         store_as=spec.store_response_as,
                         ok=False,
-                        error=str(exc),
+                        error=f"{type(exc).__name__}: {exc}",
                     )
                 )
             return events
@@ -152,8 +173,11 @@ class ToolExecutor:
                     error=f"template error: {exc}",
                 ),
             ]
+        # Record a redacted body in the event log; the real body still goes to
+        # http. EnvWriteEvent values stay raw: env is never rendered to the
+        # Talker, and export-time redaction is a later-task concern.
         events.append(
-            ToolCallEvent(tool=spec.id, args={"url": url, "body": body or {}})
+            ToolCallEvent(tool=spec.id, args={"url": url, "body": _redact(body)})
         )
         try:
             status, data = await self._http(
@@ -169,7 +193,7 @@ class ToolExecutor:
                     tool=spec.id,
                     store_as=spec.store_response_as,
                     ok=False,
-                    error=str(exc),
+                    error=f"{type(exc).__name__}: {exc}",
                 )
             )
             return events
