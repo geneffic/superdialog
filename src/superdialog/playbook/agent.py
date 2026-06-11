@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any, AsyncIterator, cast
 
 import anyio
+from anyio.abc import TaskStatus
 
 from ..agent import TurnResult
 from ..chat_context import ChatContext, ChatMessage, Role
@@ -24,6 +25,12 @@ from .runtime import PlaybookRuntime
 from .state import ConversationState
 from .talker import SpeechChunk, StreamsLLM, Talker
 from .toolexec import HttpFn, PythonToolFn
+
+
+def _abandoned(eg: BaseExceptionGroup) -> bool:
+    """True when every leaf is a GeneratorExit/cancellation (barge-in)."""
+    rest = eg.split((GeneratorExit, anyio.get_cancelled_exc_class()))[1]
+    return rest is None
 
 
 class PlaybookAgent:
@@ -110,21 +117,35 @@ class PlaybookAgent:
 
     def load_event_log(self, log: EventLog) -> None:
         """Replace the runtime's event log wholesale (lossless restore)."""
-        self.runtime.log = log
-        # Drop the snapshot cached for the old log: its version check alone
-        # cannot tell two different logs of equal length apart.
-        self.runtime._state_cache = None
+        self.runtime.load_log(log)
 
     # ---- internals ------------------------------------------------------------
 
     async def _stream_turn(self, text: str) -> AsyncIterator[StreamChunk]:
-        """Talker chunks live, then pass-through, then the done chunk."""
+        """Talker chunks live, then pass-through, then the done chunk.
+
+        Barge-in semantics: aborting this generator (host ``aclose()`` or
+        cancellation mid-stream) interrupts SPEECH, not the state machine.
+        The Talker stream stops, but the Director (``on_user_text``) runs
+        to completion in a shielded scope — the user interrupted speech,
+        so its decision still lands and the log stays quiescent. Cleanup
+        is shielded too: partial talker speech is always logged exactly
+        once and ``check_repairs`` always runs, even mid-abort, and the
+        abort never escapes ``aclose()``.
+        """
         pass_through = await self._ensure_started()
         quiescent = anyio.Event()
 
-        async def run_director() -> None:
-            pass_through.extend(await self.runtime.on_user_text(text))
-            quiescent.set()
+        async def run_director(
+            *, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED
+        ) -> None:
+            # Shielded: a barge-in cancels the Talker, never the Director.
+            # started() fires only once the shield is engaged, so tg.start
+            # guarantees the decision lands even on an immediate abort.
+            with anyio.CancelScope(shield=True):
+                task_status.started()
+                pass_through.extend(await self.runtime.on_user_text(text))
+                quiescent.set()
 
         async def director_done() -> ConversationState:
             # Event-guarded: idempotent and cancellation-safe, as the
@@ -137,29 +158,46 @@ class PlaybookAgent:
         # from the current state; hard gates barrier via director_done.
         speak_state = self.runtime.state
         talker_chunks: list[SpeechChunk] = []
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(run_director)
-            speech = self._talker.speak(speak_state, director_done=director_done)
-            async for chunk in speech:
-                talker_chunks.append(chunk)
-                if chunk.text:
-                    yield StreamChunk(text=chunk.text)
-        # task-group exit == Director done: pass-through is complete here
+        speech = self._talker.speak(speak_state, director_done=director_done)
+        aborted = False
+        try:
+            async with anyio.create_task_group() as tg:
+                await tg.start(run_director)
+                async for chunk in speech:
+                    talker_chunks.append(chunk)
+                    if chunk.text:
+                        yield StreamChunk(text=chunk.text)
+            # task-group exit == Director done: pass-through is complete here
+        except BaseExceptionGroup as eg:
+            # A GeneratorExit thrown at the yield (or a cancellation) can
+            # surface from the task group wrapped in a group; a pure-abort
+            # group just means the host abandoned the stream.
+            if not _abandoned(eg):
+                raise
+            aborted = True
+        finally:
+            # Runs on GeneratorExit too; shield so the async cleanup
+            # survives the abort. The task group has already waited for the
+            # shielded Director, so the log is quiescent here.
+            with anyio.CancelScope(shield=True):
+                await speech.aclose()  # close the Talker's LLM stream now
+                talker_text = "".join(c.text for c in talker_chunks).strip()
+                if talker_text:
+                    # The runtime never sees Talker speech; log it here —
+                    # exactly once, partial or complete.
+                    self.runtime.log.append(
+                        UtteranceEvent(
+                            role="assistant",
+                            text=talker_text,
+                            spoke_from_version=talker_chunks[-1].spoke_from_version,
+                        )
+                    )
+                await self.runtime.check_repairs()
+        if aborted:
+            return  # exit without yielding so the host's aclose() is clean
 
-        talker_text = "".join(c.text for c in talker_chunks).strip()
-        if talker_text:
-            # The runtime never sees Talker speech; log it here, exactly once.
-            self.runtime.log.append(
-                UtteranceEvent(
-                    role="assistant",
-                    text=talker_text,
-                    spoke_from_version=talker_chunks[-1].spoke_from_version,
-                )
-            )
         for line in pass_through:
             yield StreamChunk(text=line)
-        await self.runtime.check_repairs()
-
         full = talker_text
         if pass_through:
             full = (talker_text + " " + " ".join(pass_through)).strip()

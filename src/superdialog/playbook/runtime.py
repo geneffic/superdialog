@@ -73,6 +73,16 @@ class PlaybookRuntime:
             self._state_cache_version = self.log.version
         return self._state_cache
 
+    def load_log(self, log: EventLog) -> None:
+        """Replace the event log wholesale and invalidate the state cache.
+
+        The cache's version check alone cannot tell two different logs of
+        equal length apart, so a wholesale swap must drop the snapshot too.
+        """
+        self.log = log
+        self._state_cache = None
+        self._state_cache_version = -1
+
     async def start(self) -> list[str]:
         """Seed env, enter the initial checkpoint, and run to quiescence."""
         for key, value in self._pb.env.items():

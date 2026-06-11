@@ -1,9 +1,14 @@
 """PlaybookAgent: the Playbook engine behind the public Agent protocol."""
 
+from typing import AsyncIterator
+
+import anyio
+
 from superdialog.agent import Agent, TurnResult
 from superdialog.playbook import EventLog, PlaybookAgent
 from superdialog.playbook.events import UtteranceEvent
 from superdialog.playbook.models import Playbook
+from superdialog.playbook.talker import StreamsLLM
 from tests.playbook.test_director import CannedLLM
 from tests.playbook.test_models import MINIMAL_YAML
 from tests.playbook.test_talker import StreamLLM
@@ -12,13 +17,27 @@ from tests.playbook.test_toolexec import FakeHttp
 _IDLE_VERDICT: dict = {"slots": {}, "advance": None, "note": None}
 
 
+class SlowStreamLLM:
+    """Talker LLM that sleeps between tokens so a barge-in lands mid-stream."""
+
+    def __init__(self, chunks: list[str], delay: float = 0.05) -> None:
+        self.chunks = chunks
+        self.delay = delay
+
+    async def stream(self, messages: list[dict], **kwargs: object) -> AsyncIterator:
+        for c in self.chunks:
+            yield c
+            await anyio.sleep(self.delay)
+
+
 def _agent(
     verdict: dict | None = None,
     http_responses: list[tuple[int, dict]] | None = None,
+    talker_llm: StreamsLLM | None = None,
 ) -> PlaybookAgent:
     return PlaybookAgent(
         playbook=Playbook.from_yaml(MINIMAL_YAML),
-        talker_llm=StreamLLM(["Which", " city?"]),
+        talker_llm=talker_llm or StreamLLM(["Which", " city?"]),
         director_llm=CannedLLM(verdict or _IDLE_VERDICT),
         http=FakeHttp(http_responses or []),
     )
@@ -84,6 +103,47 @@ async def test_event_log_round_trip() -> None:
     agent2 = _agent()
     agent2.load_event_log(restored)
     assert agent2.runtime.state.checkpoint_id == agent.runtime.state.checkpoint_id
+
+
+async def test_barge_in_aborts_cleanly() -> None:
+    """aclose() mid-stream: no leak, partial speech logged, agent usable."""
+    agent = _agent(
+        verdict={"slots": {"city": "Pune"}, "advance": None, "note": None},
+        talker_llm=SlowStreamLLM(["Where", " to", " today?"]),
+    )
+    gen = await agent.turn("hello", stream=True)
+    assert not isinstance(gen, TurnResult)
+    first = await gen.__anext__()  # consume exactly one live chunk
+    assert first.text == "Where"
+    await gen.aclose()  # barge-in: must return normally, nothing escapes
+    partial = [
+        e
+        for e in agent.runtime.log.events
+        if isinstance(e, UtteranceEvent) and e.role == "assistant" and e.text == "Where"
+    ]
+    assert len(partial) == 1  # partial talker speech logged exactly once
+    assert partial[0].spoke_from_version is not None
+    # The Director's decision from the aborted turn landed (shielded).
+    assert agent.runtime.state.slots["city"].value == "Pune"
+    version_after_abort = agent.runtime.log.version
+    # The runtime is still usable: a follow-up non-streaming turn works.
+    result = await agent.turn("Pune please")
+    assert isinstance(result, TurnResult)
+    assert agent.runtime.log.version > version_after_abort
+
+
+async def test_load_event_log_via_public_seam() -> None:
+    """load_log swaps equal-length distinct logs without cache poison."""
+    agent = _agent()
+    log_a = EventLog()
+    log_a.append(UtteranceEvent(role="user", text="alpha"))
+    log_b = EventLog()
+    log_b.append(UtteranceEvent(role="user", text="beta"))
+    agent.load_event_log(log_a)
+    assert agent.runtime.state.transcript[-1].text == "alpha"  # cache primed
+    # Equal-length swap: the version check alone cannot tell A from B.
+    agent.load_event_log(log_b)
+    assert agent.runtime.state.transcript[-1].text == "beta"
 
 
 async def test_turn_includes_pass_through() -> None:
