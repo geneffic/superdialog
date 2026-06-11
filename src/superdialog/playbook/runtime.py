@@ -64,7 +64,10 @@ class PlaybookRuntime:
 
     @property
     def state(self) -> ConversationState:
-        """Current state, refolded whenever the log has new events."""
+        """Current state, refolded whenever the log has new events.
+
+        Returns a shared cached snapshot; callers must not mutate it.
+        """
         if self._state_cache is None or self._state_cache_version != self.log.version:
             self._state_cache = ConversationState.fold(self.log, self._pb)
             self._state_cache_version = self.log.version
@@ -80,14 +83,24 @@ class PlaybookRuntime:
         return pass_through
 
     async def on_user_text(self, text: str) -> list[str]:
-        """Process one user utterance: Director verdict, policies, quiescence."""
+        """Process one user utterance: Director verdict, policies, quiescence.
+
+        Returning implies the runtime is quiescent: all hops and policies have
+        resolved (Task 11's barrier relies on this as API).
+        """
         self.log.append(UtteranceEvent(role="user", text=text))
         decision = await self._director.evaluate(self.state)
+        pass_through: list[str] = []
         if decision.degraded:
             self.log.append(DegradedEvent(component="director", detail=decision.detail))
-            return []
-        pass_through: list[str] = []
-        if any(isinstance(e, AdvanceEvent) for e in decision.events):
+            # LLM-free policies still apply in degraded mode.
+            await self._apply_turn_budget(pass_through)
+            pass_through.extend(await self._quiesce())
+            return pass_through
+        advance = next(
+            (e for e in decision.events if isinstance(e, AdvanceEvent)), None
+        )
+        if advance is not None and not advance.rule.startswith("interrupt:"):
             current = self.state.checkpoint_id
             if current is not None:  # we are leaving: surface its verbatim line
                 self._speak_verbatim(self._pb.checkpoint(current), pass_through)
@@ -116,6 +129,13 @@ class PlaybookRuntime:
             None,
         )
         if last is None or last.spoke_from_version is None or "?" not in last.text:
+            return
+        if any(  # idempotent: this stale utterance was already repaired
+            isinstance(e, SteeringNoteEvent)
+            and e.kind == "repair"
+            and e.version > last.version
+            for e in self.log.events
+        ):
             return
         cp_id = self.state.checkpoint_id
         if cp_id is None:
@@ -147,6 +167,10 @@ class PlaybookRuntime:
         for _ in range(self._max_hops):
             if not await self._hop(pass_through):
                 break
+        else:  # never went quiescent: audit the runaway hop loop
+            self.log.append(
+                DegradedEvent(component="director", detail="quiesce_hop_exhaustion")
+            )
         return pass_through
 
     async def _hop(self, pass_through: list[str]) -> bool:
@@ -161,7 +185,12 @@ class PlaybookRuntime:
             # pipeline finished without routing: fall through to expr rules
         decision = await self._director.evaluate(self.state, expr_only=True)
         if decision.events:
-            if any(isinstance(e, AdvanceEvent) for e in decision.events):
+            advanced = any(isinstance(e, AdvanceEvent) for e in decision.events)
+            failure_routed = any(  # error_context write == failure routing
+                isinstance(e, SlotWriteEvent) and e.key == "error_context"
+                for e in decision.events
+            )
+            if advanced and not failure_routed:
                 self._speak_verbatim(cp, pass_through)
             await self._apply_with_entry(decision.events, pass_through)
             return True
@@ -185,6 +214,8 @@ class PlaybookRuntime:
                 SlotWriteEvent(key=key, value=value, status="confirmed", by="director")
             )
         if result.advance_to:
+            if result.ok:  # success routing surfaces the verbatim line;
+                self._speak_verbatim(cp, pass_through)  # retry-exhaust stays silent
             await self._advance(result.advance_to, "pipeline", pass_through)
             return True
         if not result.ok and cp.on_failure:
@@ -201,6 +232,8 @@ class PlaybookRuntime:
         n = self.state.silence_count
         if n <= policy.max_prompts:
             prompt = policy.prompts[n - 1] if n - 1 < len(policy.prompts) else None
+            if prompt is not None:  # the user hears it: it belongs in the log
+                self.log.append(UtteranceEvent(role="assistant", text=prompt))
             return ExternalResult(prompt=prompt)
         if not policy.then:
             return ExternalResult()
@@ -221,6 +254,9 @@ class PlaybookRuntime:
             )
         pass_through: list[str] = []
         if result.advance_to:
+            # Handler advances stay silent: ExternalResult cannot carry
+            # pass-through speech, and logging unheard speech would make the
+            # transcript lie about what the user heard.
             await self._advance(result.advance_to, "pipeline", pass_through)
         await self._quiesce()
         return ExternalResult()
@@ -281,11 +317,9 @@ class PlaybookRuntime:
                 and e.text == text
             ):
                 return  # already spoken since this entry
-        self.log.append(
-            UtteranceEvent(
-                role="assistant", text=text, spoke_from_version=state.version
-            )
-        )
+        # No spoke_from_version: author verbatim can't be stale, and stamping
+        # one would draw spurious repair notes on question-shaped verbatims.
+        self.log.append(UtteranceEvent(role="assistant", text=text))
         pass_through.append(text)
 
     def _pipeline_ran_this_entry(self, state: ConversationState) -> bool:

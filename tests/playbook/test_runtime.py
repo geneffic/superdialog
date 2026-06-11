@@ -136,3 +136,160 @@ async def test_turn_budget_steers() -> None:
     assert any("wrap" in n.text for n in notes)
     # budget exceeded but within grace and no on_failure: stay put
     assert rt.state.checkpoint_id == "j.a"
+
+
+INTERRUPT_YAML = textwrap.dedent("""
+    journeys:
+      j:
+        checkpoints:
+          - id: a
+            goal: "chat"
+            say_verbatim: "Your booking is held."
+            advance_when:
+              - {when: "user is done", judge: llm, to: j.done}
+          - id: done
+            terminal: true
+            outcome: done
+    interrupts:
+      - {id: goodbye, when: "caller says goodbye", judge: llm,
+         to: j.done, resume: false}
+""")
+
+
+async def test_interrupt_exit_does_not_speak_verbatim() -> None:
+    pb = Playbook.from_yaml(INTERRUPT_YAML)
+    rt = PlaybookRuntime(
+        pb,
+        director_llm=CannedLLM(
+            {"slots": {}, "advance": None, "note": None, "interrupt": "goodbye"}
+        ),
+        http=FakeHttp([]),
+    )
+    await rt.start()
+    speech = await rt.on_user_text("goodbye now")
+    # interrupt bail-out must not speak the checkpoint's success line
+    assert rt.state.ended
+    assert not any("held" in s for s in speech)
+    assert not any(
+        e.type == "utterance" and e.role == "assistant" and "held" in e.text
+        for e in rt.log.events
+    )
+
+
+PIPELINE_ROUTE_YAML = textwrap.dedent("""
+    journeys:
+      j:
+        checkpoints:
+          - id: collect
+            goal: "get started"
+            advance_when:
+              - {when: "ready to hold", judge: llm, to: j.hold}
+          - id: hold
+            say_verbatim: "Your spot is held."
+            pipeline: hold_pipe
+          - id: done
+            terminal: true
+            outcome: done
+    tools:
+      - id: hold_slot
+        method: POST
+        url: "https://api.test/hold"
+    pipelines:
+      - id: hold_pipe
+        steps:
+          - tool: hold_slot
+            on: {ok: j.done}
+""")
+
+
+async def test_pipeline_success_routing_speaks_verbatim() -> None:
+    pb = Playbook.from_yaml(PIPELINE_ROUTE_YAML)
+    rt = PlaybookRuntime(
+        pb,
+        director_llm=CannedLLM({"slots": {}, "advance": "j.hold", "note": None}),
+        http=FakeHttp([(200, {"data": {}})]),
+    )
+    await rt.start()
+    speech = await rt.on_user_text("book it")
+    assert rt.state.ended and rt.state.outcome == "done"
+    # ok-routing surfaces the routed checkpoint's verbatim line
+    assert any("held" in s for s in speech)
+
+
+async def test_silence_prompts_logged() -> None:
+    rt = _runtime({"slots": {}, "advance": None, "note": None})
+    await rt.start()
+    r = await rt.on_external(ExternalEvent(kind="silence", name="user_silence"))
+    assert r.prompt == "Can you hear me?"
+    assert any(
+        e.type == "utterance" and e.role == "assistant" and e.text == "Can you hear me?"
+        for e in rt.log.events
+    )
+
+
+async def test_check_repairs_idempotent() -> None:
+    rt = _runtime({"slots": {}, "advance": None, "note": None})
+    await rt.start()
+    stale_version = rt.state.version
+    rt.log.append(UtteranceEvent(role="user", text="my city is Pune"))
+    rt.log.append(
+        UtteranceEvent(
+            role="assistant",
+            text="Which city would you like?",
+            spoke_from_version=stale_version,
+        )
+    )
+    rt.log.append(
+        SlotWriteEvent(key="city", value="Pune", status="confirmed", by="director")
+    )
+    await rt.check_repairs()
+    await rt.check_repairs()
+    repairs = [
+        e for e in rt.log.events if e.type == "steering_note" and e.kind == "repair"
+    ]
+    assert len(repairs) == 1
+
+
+PING_PONG_YAML = textwrap.dedent("""
+    journeys:
+      j:
+        checkpoints:
+          - id: a
+            auto: true
+            advance_when:
+              - {when: "always", judge: llm, to: j.b}
+          - id: b
+            auto: true
+            advance_when:
+              - {when: "always", judge: llm, to: j.a}
+""")
+
+
+async def test_hop_exhaustion_logged() -> None:
+    pb = Playbook.from_yaml(PING_PONG_YAML)
+    rt = PlaybookRuntime(
+        pb,
+        director_llm=CannedLLM({"slots": {}, "advance": None, "note": None}),
+        http=FakeHttp([]),
+    )
+    await rt.start()  # a <-> b auto ping-pong never settles
+    assert any(
+        e.type == "degraded" and e.detail == "quiesce_hop_exhaustion"
+        for e in rt.log.events
+    )
+
+
+async def test_degraded_path_still_applies_policies() -> None:
+    class BadLLM:
+        async def complete(self, messages, **kwargs) -> str:
+            return "not json {"
+
+    pb = Playbook.from_yaml(TURN_BUDGET_YAML)
+    rt = PlaybookRuntime(pb, director_llm=BadLLM(), http=FakeHttp([]))
+    await rt.start()
+    await rt.on_user_text("hello")
+    await rt.on_user_text("still here")
+    assert any(e.type == "degraded" for e in rt.log.events)
+    # turn budget (LLM-free) still steers despite Director degradation
+    notes = [e for e in rt.log.events if e.type == "steering_note"]
+    assert any("wrap" in n.text for n in notes)
