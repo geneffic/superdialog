@@ -18,7 +18,12 @@ class PipelineResult(BaseModel):
 
 
 def _refold(state: ConversationState, events: list[Event]) -> ConversationState:
-    """Overlay pipeline-internal events so later steps see results/env updates."""
+    """Overlay pipeline-internal events so later steps see results/env updates.
+
+    Invariant: pipeline events never contain SlotWriteEvents (ToolExecutor
+    emits only ToolCall/ToolResult/EnvWrite), so slots are deliberately not
+    overlaid here.
+    """
     log = EventLog()
     for e in events:
         log.append(e.model_copy(update={"version": 0}))
@@ -46,12 +51,24 @@ class PipelineRunner:
             refresh_events = await self._ex.execute(
                 self._pb.tool(mw.refresh_with), state
             )
+            # Replay state overlays only the refresh events; a run_once tool
+            # that 401s is intentionally replayed (real-log count converges
+            # after the caller appends these events).
             state = _refold(state, refresh_events)
             replay_events = await self._ex.execute(self._pb.tool(tool_id), state)
             return [*events, *refresh_events, *replay_events]
         return events
 
     async def run(self, pipeline_id: str, state: ConversationState) -> PipelineResult:
+        """Run a pipeline's steps in order and report the outcome.
+
+        The returned ``result.events`` are NOT yet in any log: the caller
+        must append them to the real event log (including middleware refresh
+        events, so a refreshed token outlives the run). Error reporting is
+        asymmetric: typed ``http_<code>`` branches are author-handled and
+        leave ``error_slot`` empty, while retry-exhaust and no-branch
+        failures set ``error_context``.
+        """
         spec = self._pb.pipeline(pipeline_id)
         result = PipelineResult()
         for step in spec.steps:

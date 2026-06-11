@@ -1,6 +1,7 @@
 import textwrap
 
 import pytest
+from pydantic import ValidationError
 
 from superdialog.playbook.models import Playbook, RetrySpec
 
@@ -145,6 +146,12 @@ def test_duplicate_ids_rejected() -> None:
     )
     with pytest.raises(ValueError, match="hold_slot"):
         Playbook.from_yaml(dup_tool)
+
+
+def test_retry_spec_capped() -> None:
+    with pytest.raises(ValidationError):
+        RetrySpec(retry=11)
+    assert RetrySpec(retry=10).retry == 10
 
 
 def test_dotted_journey_name_rejected() -> None:

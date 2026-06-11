@@ -78,7 +78,9 @@ class DispatchEntry(BaseModel):
 
 
 class RetrySpec(BaseModel):
-    retry: int = 0
+    # Capped: an unbounded retry from a buggy compiler would become an HTTP
+    # hot loop inside a live call (middleware can triple the call count).
+    retry: int = Field(0, ge=0, le=10)
     on_exhaust: str | None = None  # checkpoint id
 
 

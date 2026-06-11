@@ -1,4 +1,4 @@
-from superdialog.playbook.events import EventLog, SlotWriteEvent
+from superdialog.playbook.events import EnvWriteEvent, EventLog, SlotWriteEvent
 from superdialog.playbook.models import (
     MiddlewareSpec,
     PipelineSpec,
@@ -45,6 +45,19 @@ def _pb(
                 method="POST",
                 url="http://t/auth",
                 env_updates={"ACCESS_TOKEN": "token"},
+            ),
+            ToolSpec(
+                id="maybe",
+                method="POST",
+                url="http://t/maybe",
+                store_response_as="maybe_result",
+                when="slots.nonexistent",
+            ),
+            ToolSpec(
+                id="confirm_hold",
+                method="POST",
+                url="http://t/confirm/{{ results.hold_result.data.hold_id }}",
+                store_response_as="confirm_result",
             ),
         ],
         pipelines=[PipelineSpec(id="p", steps=steps)],
@@ -140,3 +153,73 @@ async def test_failure_without_branch_stops() -> None:
     result = await runner.run("p", _state())
     assert not result.ok and result.advance_to is None
     assert result.error_slot == {"error_context": "p:hold"}
+
+
+async def test_skipped_step_continues() -> None:
+    # Middleware is configured: a skipped step (no ToolResultEvent) must not
+    # trigger a refresh, and the pipeline must proceed to the next step.
+    pb = _pb(
+        [
+            PipelineStep(tool="maybe", on={"ok": "continue"}),
+            PipelineStep(tool="confirm", on={"ok": "j.done"}),
+        ],
+        middleware=MiddlewareSpec(on_status=401, refresh_with="refresh"),
+    )
+    http = FakeHttp([(200, {})])
+    runner = PipelineRunner(pb, ToolExecutor(http=http))
+    result = await runner.run("p", _state())
+    assert result.ok and result.advance_to == "j.done"
+    assert len(http.calls) == 1  # only "confirm"; skip is silent
+
+
+async def test_refresh_env_event_in_result_events() -> None:
+    # The refreshed token must survive the run: result.events carries the
+    # EnvWriteEvent so the caller's real log retains it.
+    pb = _pb(
+        [PipelineStep(tool="hold", on={"ok": "j.done"})],
+        middleware=MiddlewareSpec(on_status=401, refresh_with="refresh"),
+    )
+    http = FakeHttp([(401, {}), (200, {"token": "tok-NEW"}), (200, {})])
+    runner = PipelineRunner(pb, ToolExecutor(http=http))
+    result = await runner.run("p", _state())
+    assert any(
+        isinstance(e, EnvWriteEvent)
+        and e.key == "ACCESS_TOKEN"
+        and e.value == "tok-NEW"
+        for e in result.events
+    )
+
+
+async def test_cross_step_result_visibility() -> None:
+    # Step 2's url template reads step 1's stored result via the _refold
+    # overlay in the main loop.
+    pb = _pb(
+        [
+            PipelineStep(tool="hold", on={"ok": "continue"}),
+            PipelineStep(tool="confirm_hold", on={"ok": "j.done"}),
+        ]
+    )
+    http = FakeHttp([(200, {"hold_id": "h9"}), (200, {})])
+    runner = PipelineRunner(pb, ToolExecutor(http=http))
+    result = await runner.run("p", _state())
+    assert result.ok and result.advance_to == "j.done"
+    assert "h9" in http.calls[1]["url"]
+
+
+async def test_retry_then_success() -> None:
+    pb = _pb(
+        [
+            PipelineStep(
+                tool="confirm",
+                on={
+                    "ok": "j.done",
+                    "failed": RetrySpec(retry=2, on_exhaust="j.fallback"),
+                },
+            )
+        ]
+    )
+    http = FakeHttp([(503, {}), (200, {})])
+    runner = PipelineRunner(pb, ToolExecutor(http=http))
+    result = await runner.run("p", _state())
+    assert result.ok and result.advance_to == "j.done"
+    assert len(http.calls) == 2  # one failure + one success, no extras
