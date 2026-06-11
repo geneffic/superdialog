@@ -371,7 +371,8 @@ def _compile_tool(
     ``str`` args. A JSON-parseable body template becomes a body dict with
     rewritten string values; a non-JSON template (raw Jinja-in-JSON) is
     kept whole under the ``_template`` key and noted in the coverage
-    report — the executor renders it as a plain string value.
+    report — the executor renders it, then JSON-parses the rendered text
+    into the real request body.
     """
     body: dict[str, Any] = {}
     if action.body_template:
@@ -389,7 +390,7 @@ def _compile_tool(
             }
             note = (
                 f"tool {action.id}: non-JSON body template kept under "
-                "'_template' (rendered as a string by the executor)"
+                "'_template' (rendered then JSON-parsed by the executor)"
             )
             if note not in notes:
                 notes.append(note)
@@ -423,9 +424,10 @@ class CoverageReport(BaseModel):
     """Lossless-compilation audit: what mapped where, and what did not.
 
     ``dropped`` buckets are informational: silence_policy/middleware/
-    handler list constructs absorbed by policies, computational_chains
-    and hubs list silent nodes folded into advance rules + on_enter
-    tools. Anything in the ``unmapped_*`` lists is a compiler bug.
+    handler list constructs absorbed by policies; computational_chains
+    and hubs list silent nodes folded into advance rules or compiled to
+    intermediate pipeline checkpoints. Anything in the ``unmapped_*``
+    lists is a compiler bug.
     """
 
     unmapped_nodes: list[str] = Field(default_factory=list)
@@ -465,7 +467,24 @@ class _Landing:
     condition: str | None  # None -> use the source edge's own condition
     requires: list[str]  # extra requires picked up from hub edge schemas
     slots: dict[str, SlotSpec]  # extra slot declarations (hub schemas)
-    actions: list[str]  # chain on_enter tool ids, in path order
+
+
+@dataclass
+class _ChainPlan:
+    """A linearized tool chain: pipeline steps plus landing routes.
+
+    ``success``/``failure`` are checkpoint refs ("main.X") or None when
+    the chain did not surface one (the caller falls back to the source
+    checkpoint). ``extra_rules`` preserve branches the pipeline cannot
+    route deterministically (kept as llm rules on the intermediate).
+    ``goal_names`` are cosmetic and excluded from the dedup signature.
+    """
+
+    steps: list[PipelineStep] = field(default_factory=list)
+    goal_names: list[str] = field(default_factory=list)
+    success: str | None = None
+    failure: str | None = None
+    extra_rules: list[AdvanceRule] = field(default_factory=list)
 
 
 # -- full compilation ----------------------------------------------------------
@@ -473,6 +492,12 @@ class _Landing:
 _SILENCE_RE = re.compile(r"silence|no\s+response|not\s+respond", re.I)
 _TOKEN_EDGE_RE = re.compile(r"\b401\b|token", re.I)
 _STATUS_CODE_RE = re.compile(r"\b([45]\d{2})\b")
+# Failure-shaped branch conditions ("X.success is false", "API returned an
+# error", "creation failed"): routable as the pipeline step's `failed` exit.
+_FAILURE_COND_RE = re.compile(
+    rf"\.success\s*{_EQ}\s*false|\bnot\s+\w+\.success\b|\berror\b|\bfail",
+    re.I,
+)
 _HUB_MIN_EDGES = 4
 _MAX_CHAIN_DEPTH = 10
 
@@ -510,9 +535,12 @@ class _Compiler:
     """Single-journey ("main") lossless flow → playbook compilation.
 
     Journey splitting is an authoring concern; the compiler stays
-    lossless and boring. Computational nodes never become checkpoints:
-    they are folded into their conversational sources' advance rules and
-    their on_enter tools land on the target checkpoints (path-wise).
+    lossless and boring. Computational nodes never become checkpoints
+    themselves: tool-free chains fold into their conversational sources'
+    advance rules, while tool-bearing chains compile to a PipelineSpec
+    owned by a synthetic INTERMEDIATE checkpoint — tools run as pipeline
+    steps and route on their results, never as on_enter side effects of
+    landing checkpoints.
     """
 
     def __init__(self, flow: ConversationFlow) -> None:
@@ -550,6 +578,10 @@ class _Compiler:
             hub: union_slot_schemas(self.idx.node(hub)) for hub in self.hubs
         }
         self.checkpoints: dict[str, Checkpoint] = {}
+        self.intermediates: list[str] = []  # synthetic checkpoint ids, in order
+        self.chain_pipelines: list[PipelineSpec] = []
+        self._chain_by_sig: dict[str, str] = {}  # plan signature -> checkpoint id
+        self._chain_active: set[str] = set()  # nodes on the build stack (cycles)
 
     def _rw(self, text: str) -> str:
         return _rewrite_template(text, self.env_keys, self.result_keys)
@@ -661,14 +693,18 @@ class _Compiler:
             return []
         self.trace.mapped_edges.add((source_id, edge.id))
         if target in self.checkpoints:
-            return [_Landing(target, None, [], {}, [])]
+            return [_Landing(target, None, [], {})]
         if self.kinds.get(target) != "computational":
             self._drop_edge(source_id, edge, "unsupported_target")
             return []
+        origin = f"main.{source_id}" if source_id in self.checkpoints else None
+        if target not in self.hubs and self._chain_has_tools(target):
+            cp_id = self._chain_checkpoint(source_id, edge.id, target, origin)
+            if cp_id is not None:
+                return [_Landing(cp_id, None, [], {})]
         out: list[_Landing] = []
         self._walk(
             node_id=target,
-            actions=[],
             condition=None,
             requires=[],
             slots={},
@@ -676,13 +712,13 @@ class _Compiler:
             seen=set(),
             out=out,
             depth=1,
+            origin=origin,
         )
         return out
 
     def _walk(
         self,
         node_id: str,
-        actions: list[str],
         condition: str | None,
         requires: list[str],
         slots: dict[str, SlotSpec],
@@ -690,15 +726,20 @@ class _Compiler:
         seen: set[str],
         out: list[_Landing],
         depth: int,
+        origin: str | None,
     ) -> None:
-        """DFS a computational chain, collecting checkpoint landings.
+        """DFS a tool-free computational chain, collecting landings.
 
         The first edge of a multi-exit node is the DEFAULT path and
         inherits the current condition (the source edge's, on the pure
         default path); other exits re-condition on their own edge. Hub
         nodes (≥ ``_HUB_MIN_EDGES`` exits) re-condition EVERY exit and
-        contribute their edge schemas' slots/requires. on_enter tool ids
-        accumulate path-wise and land on each landing checkpoint.
+        contribute their edge schemas' slots/requires. Tool-bearing
+        chains never fold here: any computational target whose chain
+        declares on_enter tools lands on a pipeline intermediate
+        instead (see :meth:`_chain_checkpoint`), so walked paths carry
+        no side effects — except hubs, which are noted if they declare
+        tools of their own.
         """
         node = self.idx.node(node_id)
         self.trace.mapped_nodes.add(node_id)
@@ -709,12 +750,16 @@ class _Compiler:
                 f"chain node {node_id}: static_text not carried "
                 "(folded node has no speaking turn)"
             )
+        if _on_enter_ids(node):  # only hubs can reach here with tools
+            self.trace.note(
+                f"chain node {node_id}: on_enter tools not carried by the "
+                "rule fold (hub tools are not pipeline-owned)"
+            )
         if depth > _MAX_CHAIN_DEPTH:
             self.trace.note(
                 f"chain walk depth bound ({_MAX_CHAIN_DEPTH}) hit at {node_id}"
             )
             return
-        actions = [*actions, *_on_enter_ids(node)]
         multi = len(node.edges) > 1
         for i, edge in enumerate(node.edges):
             target = edge.target_node_id
@@ -740,8 +785,8 @@ class _Compiler:
             if target in visited:
                 # Cycle back into the walk (often to the source checkpoint
                 # itself): the edge is accounted for, but a self-landing
-                # would re-fire the chain's tools on every entry, so it is
-                # suppressed and surfaced as a note instead.
+                # would loop the rule fold, so it is suppressed and
+                # surfaced as a note instead.
                 self.trace.note(
                     f"chain loop suppressed: {node_id}:{edge.id} returns to {target}"
                 )
@@ -749,12 +794,17 @@ class _Compiler:
             if target in self.checkpoints:
                 if target not in seen:
                     seen.add(target)
-                    out.append(_Landing(target, b_cond, b_req, b_slots, actions))
+                    out.append(_Landing(target, b_cond, b_req, b_slots))
                 continue
             if self.kinds.get(target) == "computational":
+                if target not in self.hubs and self._chain_has_tools(target):
+                    cp_id = self._chain_checkpoint(node_id, edge.id, target, origin)
+                    if cp_id is not None and cp_id not in seen:
+                        seen.add(cp_id)
+                        out.append(_Landing(cp_id, b_cond, b_req, b_slots))
+                    continue
                 self._walk(
                     target,
-                    actions,
                     b_cond,
                     b_req,
                     b_slots,
@@ -762,9 +812,217 @@ class _Compiler:
                     seen,
                     out,
                     depth + 1,
+                    origin,
                 )
             else:
                 self._drop_edge(node_id, edge, "unsupported_target")
+
+    # -- tool chains → intermediate pipeline checkpoints ------------------------
+
+    def _chain_has_tools(self, entry: str) -> bool:
+        """True when the chain reachable from ``entry`` declares any tool.
+
+        Reachability follows computational non-hub nodes only: a hub
+        re-conditions every exit and is folded by :meth:`_walk`, which
+        re-probes each of its computational targets.
+        """
+        seen: set[str] = set()
+        stack = [entry]
+        while stack:
+            nid = stack.pop()
+            if nid in seen or nid not in self.node_ids:
+                continue
+            seen.add(nid)
+            if (
+                self.kinds.get(nid) != "computational"
+                or nid in self.hubs
+                or nid in self.middleware_nodes
+            ):
+                continue
+            node = self.idx.node(nid)
+            if _on_enter_ids(node):
+                return True
+            stack.extend(e.target_node_id for e in node.edges if e.target_node_id)
+        return False
+
+    def _chainable(self, node_id: str) -> bool:
+        return (
+            self.kinds.get(node_id) == "computational"
+            and node_id not in self.hubs
+            and node_id not in self.middleware_nodes
+        )
+
+    def _branch_status(self, condition: str) -> int | None:
+        """HTTP status when the branch condition is a pure status predicate."""
+        for text in (condition, condition.partition(" — ")[0]):
+            m = _STATUS_RE.match(text)
+            if m and m.group(1) in self.result_keys:
+                gloss = condition.partition(" — ")[2].strip()
+                if text == condition or _NARRATION_GLOSS_RE.match(gloss):
+                    return int(m.group(2))
+        return None
+
+    def _chain_checkpoint(
+        self, src: str, edge_id: str, entry: str, fallback: str | None
+    ) -> str | None:
+        """Create (or dedup-reuse) the intermediate checkpoint owning a chain.
+
+        The chain entered at ``entry`` compiles to a PipelineSpec plus one
+        synthetic soft checkpoint that runs it on entry and routes on the
+        result: ``pipeline.ok`` → the chain's default conversational
+        landing, ``pipeline.failed`` → its failure landing (or ``fallback``,
+        the source checkpoint). Identical plans (same steps, routes, and
+        extra rules) share one intermediate. Returns the bare checkpoint
+        id, or None when the chain cannot be linearized.
+        """
+        if entry in self._chain_active:
+            self.trace.note(
+                f"chain cycle at {entry}: branch {src}:{edge_id} not routed"
+            )
+            return None
+        plan = self._build_chain_plan(entry, fallback)
+        success = plan.success or fallback
+        if success is None:
+            self.trace.note(
+                f"chain at {entry} (via {src}:{edge_id}) has no landing and "
+                "no source fallback; folded without a pipeline"
+            )
+            return None
+        failure = plan.failure or fallback or success
+        sig = json.dumps(
+            {
+                "steps": [s.model_dump(mode="json") for s in plan.steps],
+                "success": success,
+                "failure": failure,
+                "extra": [r.model_dump(mode="json") for r in plan.extra_rules],
+            },
+            sort_keys=True,
+        )
+        existing = self._chain_by_sig.get(sig)
+        if existing is not None:
+            return existing
+        if plan.failure is None and fallback is not None:
+            self.trace.note(
+                f"chain at {entry}: no failure branch in the legacy flow; "
+                f"pipeline.failed routes to {fallback}"
+            )
+        cp_id = f"{src}__{edge_id}"
+        pipe = PipelineSpec(id=f"{cp_id}_pipe", steps=plan.steps)
+        self.chain_pipelines.append(pipe)
+        self.checkpoints[cp_id] = Checkpoint(
+            id=cp_id,
+            goal="(auto) " + " → ".join(plan.goal_names),
+            pipeline=pipe.id,
+            gate="soft",
+            advance_when=[
+                AdvanceRule(when="pipeline.ok", judge="expr", to=success),
+                AdvanceRule(when="pipeline.failed", judge="expr", to=failure),
+                *plan.extra_rules,
+            ],
+        )
+        self.intermediates.append(cp_id)
+        self._chain_by_sig[sig] = cp_id
+        return cp_id
+
+    def _build_chain_plan(self, entry: str, fallback: str | None) -> _ChainPlan:
+        """Linearize the chain at ``entry`` into pipeline steps + routes.
+
+        The trunk follows each node's FIRST viable exit (the legacy
+        default path) through computational nodes until it reaches a
+        conversational landing — the chain's ``success``. Branch exits
+        route off the node's last pipeline step: a pure status predicate
+        becomes ``http_<code>``, a failure-shaped condition becomes
+        ``failed``, and anything else is preserved as an llm rule on the
+        intermediate (noted: the pipeline routes ok/failed only). A
+        branch into another tool-bearing chain routes to that chain's
+        own intermediate, built recursively.
+        """
+        plan = _ChainPlan()
+        cur: str | None = entry
+        visited: set[str] = set()
+        while cur is not None and len(visited) <= _MAX_CHAIN_DEPTH:
+            node = self.idx.node(cur)
+            visited.add(cur)
+            self._chain_active.add(cur)
+            self.trace.mapped_nodes.add(cur)
+            self.trace.drop("computational_chains", cur)
+            plan.goal_names.append(node.name)
+            if node.static_text:
+                self.trace.note(
+                    f"chain node {cur}: static_text not carried "
+                    "(folded node has no speaking turn)"
+                )
+            for tool_id in _on_enter_ids(node):
+                plan.steps.append(PipelineStep(tool=tool_id))
+            branch_step = plan.steps[-1] if plan.steps else None
+            next_trunk: str | None = None
+            trunk_taken = False
+            for edge in node.edges:
+                target = edge.target_node_id
+                if target is None or target not in self.node_ids:
+                    self._drop_edge(cur, edge, "dangling")
+                    continue
+                if target in self.silence:
+                    self._drop_edge(cur, edge, "silence_policy")
+                    continue
+                if target in self.middleware_nodes:
+                    self._drop_edge(cur, edge, "middleware")
+                    continue
+                self.trace.mapped_edges.add((cur, edge.id))
+                if not trunk_taken:  # first viable exit: the default path
+                    trunk_taken = True
+                    if target in self.checkpoints:
+                        plan.success = f"main.{target}"
+                    elif self._chainable(target) and target not in visited:
+                        next_trunk = target
+                    else:
+                        self.trace.note(
+                            f"chain trunk stops at {cur}:{edge.id} "
+                            f"(target {target} not linearizable)"
+                        )
+                    continue
+                ref = self._branch_ref(cur, edge, target, fallback)
+                if ref is None:
+                    continue
+                status = self._branch_status(edge.condition)
+                if branch_step is not None and status is not None:
+                    branch_step.on[f"http_{status}"] = ref
+                elif (
+                    branch_step is not None
+                    and _FAILURE_COND_RE.search(edge.condition)
+                    and "failed" not in branch_step.on
+                ):
+                    branch_step.on["failed"] = ref
+                    if plan.failure is None:
+                        plan.failure = ref
+                else:
+                    plan.extra_rules.append(
+                        AdvanceRule(when=edge.condition, judge="llm", to=ref)
+                    )
+                    self.trace.note(
+                        f"chain branch {cur}:{edge.id} not deterministically "
+                        "routable; kept as an llm rule on the intermediate "
+                        "(the pipeline routes ok/failed)"
+                    )
+            cur = next_trunk
+        for nid in visited:
+            self._chain_active.discard(nid)
+        return plan
+
+    def _branch_ref(
+        self, src: str, edge: Edge, target: str, fallback: str | None
+    ) -> str | None:
+        """Resolve a chain branch edge to a checkpoint ref ("main.X")."""
+        if target in self.checkpoints:
+            return f"main.{target}"
+        if self._chainable(target):
+            sub = self._chain_checkpoint(src, edge.id, target, fallback)
+            return f"main.{sub}" if sub is not None else None
+        self.trace.note(
+            f"chain branch {src}:{edge.id}: target {target} not mappable "
+            "to a checkpoint; branch dropped"
+        )
+        return None
 
     def _compile_edges(self, node: FlowNode) -> None:
         cp = self.checkpoints[node.id]
@@ -793,10 +1051,6 @@ class _Compiler:
                     cp.advance_when.append(rule)
                 for key, spec in landing.slots.items():
                     cp.slots.setdefault(key, spec)
-                landing_cp = self.checkpoints[landing.node_id]
-                for tool_id in landing.actions:
-                    if tool_id not in landing_cp.on_enter:
-                        landing_cp.on_enter.append(tool_id)
 
     # -- hubs → dispatch -------------------------------------------------------
 
@@ -936,10 +1190,9 @@ class _Compiler:
         interrupts = self._build_interrupts()
         middleware = self._apply_middleware()
         self.trace.note(
-            "chain-branch action placement approximate: computational-chain "
-            "on_enter tools attach to each landing checkpoint (path-wise), "
-            "so a branch's tools may fire on entries that did not traverse "
-            "the legacy branch"
+            "tool-bearing computational chains compile to intermediate "
+            "pipeline checkpoints: chain tools run as pipeline steps and "
+            "route on results, never as landing-checkpoint on_enter"
         )
         self.trace.note(
             "dispatch is compile-time organization in v1: the Director "
@@ -955,11 +1208,12 @@ class _Compiler:
                         for n in self.flow.nodes
                         if n.id in self.checkpoints
                     ]
+                    + [self.checkpoints[cp_id] for cp_id in self.intermediates]
                 )
             },
             dispatch=dispatch,
             tools=tools,
-            pipelines=pipelines,
+            pipelines=[*self.chain_pipelines, *pipelines],
             handlers=handlers,
             interrupts=interrupts,
             policies=Policies(silence=silence_policy),
@@ -980,8 +1234,12 @@ def compile_flow(flow: ConversationFlow) -> Playbook:
     Lossless by construction — every legacy construct lands somewhere:
 
     - conversational nodes → checkpoints in journey "main"
-    - computational nodes → folded into their sources' advance rules;
-      their on_enter actions land on the target checkpoints (path-wise)
+    - tool-free computational nodes → folded into their sources' advance
+      rules
+    - tool-bearing computational chains → a PipelineSpec plus a synthetic
+      intermediate checkpoint that runs it on entry and routes on
+      ``pipeline.ok`` / ``pipeline.failed`` (status/failure branch edges
+      become step ``on:`` routes; the rest stay as llm rules)
     - hub routers (≥4-exit computational) → dispatch entries + rules
       merged into every inbound checkpoint
     - silence nodes → ``policies.silence`` (prompts in chain order)

@@ -244,3 +244,32 @@ async def test_verdict_prompt_warns_against_injection() -> None:
     await Director(pb, llm).evaluate(state)
     system = llm.calls[0][0]["content"]
     assert "untrusted" in system
+
+
+async def test_verdict_prompt_includes_tool_results() -> None:
+    """Result-dependent llm rules must see what the tools actually did."""
+    pb, state = _state(
+        extra_events=[
+            ToolResultEvent(
+                tool="hold_slot",
+                store_as="hold_result",
+                ok=True,
+                status=200,
+                data={"secret": "never-dumped"},
+            )
+        ]
+    )
+    llm = CannedLLM({"slots": {}, "advance": None, "note": None})
+    await Director(pb, llm).evaluate(state)
+    system = llm.calls[0][0]["content"]
+    assert "Tool results:" in system
+    assert "hold_result" in system and "ok=True" in system and "status=200" in system
+    assert "never-dumped" not in system  # compact summary, no data dump
+
+
+async def test_verdict_prompt_tool_results_empty_state() -> None:
+    pb, state = _state()  # no tool results yet
+    llm = CannedLLM({"slots": {}, "advance": None, "note": None})
+    await Director(pb, llm).evaluate(state)
+    system = llm.calls[0][0]["content"]
+    assert "Tool results:\n(none)" in system

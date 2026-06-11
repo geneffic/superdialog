@@ -193,6 +193,56 @@ async def test_coercion_failure_shape() -> None:
     assert (result.error or "").startswith("bad args")
 
 
+async def test_template_body_parses_to_json() -> None:
+    # A compiler '_template' body renders to a JSON document that becomes
+    # the REAL request body — never a literal {"_template": "..."} dict.
+    spec = ToolSpec(
+        id="confirm_booking",
+        method="POST",
+        url="{{ env.API_BASE_URL }}/bookings/confirm",
+        body={"_template": '{"hold_id": {{ slots.hold_id|tojson }}, "n": 2}'},
+        store_response_as="confirm_result",
+    )
+    http = FakeHttp([(200, {"data": {"booking_id": "b1"}})])
+    events = await ToolExecutor(http=http).execute(spec, _state(hold_id="h-9"))
+    assert http.calls[0]["body"] == {"hold_id": "h-9", "n": 2}
+    assert "_template" not in http.calls[0]["body"]
+    result = events[1]
+    assert isinstance(result, ToolResultEvent) and result.ok
+
+
+async def test_template_body_invalid_json_fails() -> None:
+    spec = ToolSpec(
+        id="confirm_booking",
+        method="POST",
+        url="https://api.test/bookings/confirm",
+        body={"_template": "hold={{ slots.hold_id }} (not json)"},
+        store_response_as="confirm_result",
+    )
+    http = FakeHttp([])
+    events = await ToolExecutor(http=http).execute(spec, _state(hold_id="h-9"))
+    kinds = [type(e).__name__ for e in events]
+    assert kinds == ["ToolCallEvent", "ToolResultEvent"]
+    result = events[1]
+    assert isinstance(result, ToolResultEvent) and result.ok is False
+    assert "not valid JSON" in (result.error or "")
+    assert http.calls == []  # a broken body never reaches HTTP
+
+
+async def test_template_key_with_other_fields_is_not_parsed() -> None:
+    # Only an EXACT {"_template": <str>} body is the whole-document form.
+    spec = ToolSpec(
+        id="odd",
+        method="POST",
+        url="https://api.test/odd",
+        body={"_template": '{"a": 1}', "extra": "x"},
+        store_response_as="odd_result",
+    )
+    http = FakeHttp([(200, {})])
+    await ToolExecutor(http=http).execute(spec, _state())
+    assert http.calls[0]["body"] == {"_template": '{"a": 1}', "extra": "x"}
+
+
 async def test_env_update_missing_path_skipped() -> None:
     # env_updates wants data.hold_id, but the response has no hold_id.
     http = FakeHttp([(200, {"data": {}})])

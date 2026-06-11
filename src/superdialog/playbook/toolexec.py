@@ -8,6 +8,7 @@ sandboxed and template errors degrade to a failed ToolResultEvent.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -180,7 +181,7 @@ class ToolExecutor:
         try:
             url = _render(spec.url, ns)
             headers = {k: _render(v, ns) for k, v in spec.headers.items()}
-            body = {
+            body: Any = {
                 k: _render(v, ns) if isinstance(v, str) else v
                 for k, v in spec.body.items()
             } or None
@@ -196,6 +197,27 @@ class ToolExecutor:
                     error=f"template error: {exc}",
                 ),
             ]
+        # A compiler '_template' body is one whole Jinja-in-JSON document:
+        # the rendered text IS the request body, so parse it into the real
+        # structure (posting {"_template": "..."} literally would hand the
+        # API a string instead of fields).
+        if (
+            isinstance(body, dict)
+            and set(spec.body) == {"_template"}
+            and isinstance(body.get("_template"), str)
+        ):
+            try:
+                body = json.loads(body["_template"])
+            except ValueError:
+                return [
+                    ToolCallEvent(tool=spec.id, args=args or {}),
+                    ToolResultEvent(
+                        tool=spec.id,
+                        store_as=spec.store_response_as,
+                        ok=False,
+                        error="template body not valid JSON",
+                    ),
+                ]
         # Record a redacted url/body in the event log; the real url and body
         # still go to http. EnvWriteEvent values stay raw: env is never
         # rendered to the Talker, and export-time redaction is a later-task

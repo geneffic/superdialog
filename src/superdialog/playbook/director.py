@@ -71,6 +71,15 @@ def _verdict_prompt(
         or "(none)"
     )
     known = {k: v.value for k, v in state.slots.items()}
+    # Compact outcome summary only (ok/status), never the data payload:
+    # result-dependent rules must be judged on what the tools actually did.
+    tool_lines = (
+        "\n".join(
+            f"- {key}: ok={r.ok} status={r.status}"
+            for key, r in state.tool_results.items()
+        )
+        or "(none)"
+    )
     transcript = "\n".join(f"{m.role}: {m.text}" for m in state.transcript[-12:])
     system = (
         "You supervise a live conversation. Read the transcript and respond with "
@@ -83,6 +92,7 @@ def _verdict_prompt(
         f"Current step: {cp.id} — goal: {cp.goal}\n"
         f"Slots to extract:\n{slot_lines}\n"
         f"Already known: {json.dumps(known, default=str)}\n"
+        f"Tool results:\n{tool_lines}\n"
         f"Advance rules:\n{rule_lines}\n"
         f"Interrupts:\n{interrupt_lines}"
     )

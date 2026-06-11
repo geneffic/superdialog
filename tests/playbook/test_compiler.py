@@ -290,25 +290,104 @@ def test_rewrite_template_helper() -> None:
     assert rw("plain text without templates") == "plain text without templates"
 
 
+AVAIL_REF = "main.collect_booking_details__collect_to_check_availability"
+MONEY_REF = "main.collect_booking_confirmation_details__booking_details_to_hold"
+
+
 def test_happy_path_rules_exist() -> None:
     pb = compile_flow(_flow())
     greeting = pb.checkpoint("main.greeting")
     assert greeting.advance_when  # hub rules merged into the source
     assert any(r.to == "main.collect_booking_details" for r in greeting.advance_when)
+    # collect routes into the availability INTERMEDIATE, not past it
     collect = pb.checkpoint("main.collect_booking_details")
-    assert any(r.to == "main.present_available_slot" for r in collect.advance_when)
+    assert any(r.to == AVAIL_REF for r in collect.advance_when)
+    avail = pb.checkpoint(AVAIL_REF)
+    assert avail.pipeline is not None
+    assert [s.tool for s in pb.pipeline(avail.pipeline).steps] == [
+        "action-courses-availability"
+    ]
+    routes = {(r.when, r.judge, r.to) for r in avail.advance_when}
+    assert ("pipeline.ok", "expr", "main.present_available_slot") in routes
+    assert ("pipeline.failed", "expr", "main.offer_waitlist") in routes
+    # the nearest-slot branch is preserved as an llm rule on the intermediate
+    assert any(
+        r.judge == "llm" and r.to == "main.offer_nearest_slot"
+        for r in avail.advance_when
+    )
     present = pb.checkpoint("main.present_available_slot")
     targets = {r.to for r in present.advance_when}
     assert "main.ask_profile_details" in targets  # new caller branch
     assert "main.collect_booking_confirmation_details" in targets  # registered
+    assert AVAIL_REF in targets  # recheck reuses the shared intermediate
+    assert present.on_enter == []  # no path-wise chain tools
     confirm = pb.checkpoint("main.collect_booking_confirmation_details")
-    assert any(r.to == "main.booking_close" for r in confirm.advance_when)
+    assert any(r.to == MONEY_REF for r in confirm.advance_when)
     close = pb.checkpoint("main.booking_close")
     assert close.terminal and close.outcome == "booking_close"
-    # chain on_enter tools land on the target checkpoint, in chain order
-    assert close.on_enter == ["action-slots-hold", "action-bookings-confirm"]
-    present_enter = pb.checkpoint("main.present_available_slot").on_enter
-    assert "action-courses-availability" in present_enter
+    assert close.on_enter == []  # money tools live in the pipeline only
+
+
+def test_no_premature_money_tools() -> None:
+    """Money tools never fire as on_enter side effects of any checkpoint."""
+    pb = compile_flow(_flow())
+    money = {"action-slots-hold", "action-bookings-confirm"}
+    for journey in pb.journeys.values():
+        for cp in journey.checkpoints:
+            assert not money & set(cp.on_enter), f"{cp.id} fires {cp.on_enter}"
+    pipeline_tools = {s.tool for p in pb.pipelines for s in p.steps}
+    assert money <= pipeline_tools  # they run ONLY as pipeline steps
+
+
+def test_money_chain_is_pipeline() -> None:
+    """hold→confirm compiles to a pipeline whose results gate booking_close."""
+    pb = compile_flow(_flow())
+    money = pb.checkpoint(MONEY_REF)
+    assert money.pipeline is not None
+    steps = pb.pipeline(money.pipeline).steps
+    assert [s.tool for s in steps] == [
+        "action-slots-hold",
+        "action-bookings-confirm",
+    ]
+    # a failed hold re-runs availability via the shared intermediate
+    assert steps[0].on["failed"] == AVAIL_REF
+    # a failed confirm routes to the retry intermediate (legacy retry node)
+    retry_ref = steps[1].on["failed"]
+    assert retry_ref == "main.confirm_booking__confirm_to_retry"
+    retry = pb.checkpoint(retry_ref)
+    assert retry.pipeline is not None
+    retry_steps = pb.pipeline(retry.pipeline).steps
+    assert [s.tool for s in retry_steps] == ["action-bookings-confirm"]
+    assert retry_steps[0].on["failed"] == "main.other_query_handler"
+    # routing is judged on the pipeline RESULT, after the tools ran
+    money_routes = {(r.when, r.judge, r.to) for r in money.advance_when}
+    assert ("pipeline.ok", "expr", "main.booking_close") in money_routes
+    assert any(w == "pipeline.failed" and j == "expr" for w, j, _ in money_routes)
+    retry_routes = {(r.when, r.judge, r.to) for r in retry.advance_when}
+    assert ("pipeline.ok", "expr", "main.booking_close") in retry_routes
+    assert ("pipeline.failed", "expr", "main.other_query_handler") in retry_routes
+
+
+def test_chain_intermediates_are_dedup_shared() -> None:
+    """Every entry into the availability chain shares ONE intermediate."""
+    pb = compile_flow(_flow())
+    sources = {
+        "main.collect_booking_details",
+        "main.returning_rebook_same",
+        "main.present_available_slot",
+        "main.offer_nearest_slot",
+        "main.offer_waitlist",
+    }
+    for ref in sources:
+        cp = pb.checkpoint(ref)
+        assert any(r.to == AVAIL_REF for r in cp.advance_when), ref
+    # exactly one availability intermediate exists
+    avail_pipes = [
+        p
+        for p in pb.pipelines
+        if [s.tool for s in p.steps] == ["action-courses-availability"]
+    ]
+    assert len(avail_pipes) == 1
 
 
 def test_silence_policy_compiled_from_silence_chain() -> None:
@@ -353,7 +432,13 @@ def test_coverage_report_buckets() -> None:
     assert "still_silent_check" in report.dropped["silence_policy"]
     assert "token_refresh" in report.dropped["middleware"]
     assert "greeting_details" in report.dropped["hubs"]
-    assert any("chain-branch action placement" in n for n in report.notes)
+    chains = report.dropped["computational_chains"]
+    assert {"hold_slot_payment", "confirm_booking", "check_course_availability"} <= set(
+        chains
+    )
+    assert any("intermediate pipeline checkpoints" in n for n in report.notes)
+    # branches the pipeline cannot route deterministically are noted
+    assert any("not deterministically routable" in n for n in report.notes)
 
 
 def test_interrupt_from_global_goodbye() -> None:
