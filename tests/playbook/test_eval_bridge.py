@@ -171,3 +171,40 @@ async def test_run_eval_aggregates() -> None:
     # closer: 2/2 correct (1.0); rambler: city never extracted (0.0)
     assert report.mean_slot_accuracy == 0.5
     assert report.sessions[1].slot_diffs == {"city": ("Goa", None)}
+
+
+async def test_session_ending_during_start_takes_zero_turns() -> None:
+    """A session that reaches a terminal checkpoint in start() drives no turns."""
+    import textwrap
+
+    pb = Playbook.from_yaml(
+        textwrap.dedent("""
+            persona: x
+            journeys:
+              j:
+                checkpoints:
+                  - id: bye
+                    say_verbatim: "Goodbye."
+                    terminal: true
+                    outcome: closed
+        """)
+    )
+    agent = PlaybookAgent(
+        playbook=pb,
+        talker_llm=StreamLLM(["unused"]),
+        director_llm=CannedLLM(_IDLE_VERDICT),
+        http=FakeHttp([]),
+    )
+
+    class NeverUser:
+        async def complete(self, messages: list[dict[str, str]], **kw: Any) -> str:
+            raise AssertionError("persona LLM must not be called")
+
+    persona = PersonaSpec(name="ghost", traits="-", goal="-")
+    metrics = await run_session(agent, persona, NeverUser())
+    assert metrics.turns == 0
+    assert metrics.completed and metrics.outcome == "closed"
+    # no post-SessionEnd user utterances polluting the audit log
+    events = agent.runtime.log.events
+    end_idx = next(i for i, e in enumerate(events) if e.type == "session_end")
+    assert not any(e.type == "utterance" and e.role == "user" for e in events[end_idx:])

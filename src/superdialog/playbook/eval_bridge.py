@@ -97,7 +97,7 @@ async def run_session(
     await agent.runtime.start()  # greeting/pass-through lands in the log
     user_text = persona.opening
     turns = 0
-    while turns < persona.max_turns:
+    while turns < persona.max_turns and not agent.runtime.state.ended:
         await agent.turn(user_text)
         turns += 1
         if agent.runtime.state.ended or turns >= persona.max_turns:

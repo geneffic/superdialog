@@ -59,7 +59,13 @@ def _is_director_advance(e: Event) -> bool:
 
 
 def _decisions(events: Sequence[Event]) -> tuple[str | None, dict[str, Any]]:
-    """Extract (advance target, slot writes) attributable to the Director."""
+    """Extract (advance target, slot writes) attributable to the Director.
+
+    TODO: quiescence-time slot writes (pipeline ``error_slot`` exports, expr
+    ``set:`` writes) are stamped ``by="director"`` by the runtime, so a
+    recorded pipeline-failure session replays as unstable even with an
+    identical playbook+LLM. Needs a provenance marker on those events.
+    """
     target = next((e.to_checkpoint for e in events if _is_director_advance(e)), None)
     slots = {
         e.key: e.value
