@@ -502,3 +502,101 @@ def test_chat_malformed_flow_exits_clean(
     assert rc == 1
     mock_flow.assert_not_called()
     assert "Could not load flow" in capsys.readouterr().err
+
+
+# -- simple playbook detection / dispatch ------------------------------------
+
+_SIMPLE_PLAYBOOK = """\
+name: "Tiny"
+persona:
+  identity: "You are a tiny demo agent."
+playbook:
+  - id: only
+    purpose: "Say hi and stop."
+    say: "Hi there!"
+    done_when: "greeted"
+"""
+
+
+def _write_simple(tmp_path: Path) -> Path:
+    path = tmp_path / "simple.yaml"
+    path.write_text(_SIMPLE_PLAYBOOK)
+    return path
+
+
+def test_chat_detects_simple_playbook(tmp_path: Path) -> None:
+    path = _write_simple(tmp_path)
+    with (
+        patch.object(_cli_main_module, "_run_simple_repl") as mock_simple,
+        patch.object(_cli_main_module, "_run_playbook_repl") as mock_play,
+        patch.object(_cli_main_module, "_run_chat_repl") as mock_flow,
+    ):
+        rc = main(["chat", "--flow", str(path)])
+    assert rc == 0
+    mock_flow.assert_not_called()
+    mock_play.assert_not_called()
+    mock_simple.assert_called_once()
+    assert mock_simple.call_args[0][0] == str(path)
+
+
+def test_chat_explicit_simple_flag(tmp_path: Path) -> None:
+    path = _write_simple(tmp_path)
+    with (
+        patch.object(_cli_main_module, "_run_simple_repl") as mock_simple,
+        patch.object(_cli_main_module, "_run_chat_repl") as mock_flow,
+    ):
+        rc = main(["chat", "--simple", str(path)])
+    assert rc == 0
+    mock_flow.assert_not_called()
+    mock_simple.assert_called_once()
+    assert mock_simple.call_args[0][0] == str(path)
+
+
+def test_chat_journeys_wins_over_playbook_list(tmp_path: Path) -> None:
+    path = tmp_path / "p.yaml"
+    path.write_text(_MINIMAL_PLAYBOOK)
+    with (
+        patch.object(_cli_main_module, "_run_simple_repl") as mock_simple,
+        patch.object(_cli_main_module, "_run_playbook_repl") as mock_play,
+    ):
+        rc = main(["chat", "--flow", str(path)])
+    assert rc == 0
+    mock_simple.assert_not_called()
+    mock_play.assert_called_once()
+
+
+def test_chat_missing_simple_file(capsys: pytest.CaptureFixture) -> None:
+    rc = main(["chat", "--simple", "/nope-simple.yaml"])
+    assert rc == 1
+    assert "/nope-simple.yaml" in capsys.readouterr().err
+
+
+def test_chat_malformed_simple_exits_clean(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("playbook:\n  - not_a_step_mapping\n")
+    with patch.object(_cli_main_module, "_run_simple_repl") as mock_simple:
+        rc = main(["chat", "--flow", str(bad)])
+    assert rc == 1
+    mock_simple.assert_not_called()
+    assert "Invalid simple playbook" in capsys.readouterr().err
+
+
+def test_chat_still_runs_flow_after_simple_detection(tmp_path: Path) -> None:
+    flow_data = {
+        "id": "t",
+        "system_prompt": "s",
+        "initial_node": "n",
+        "nodes": [{"id": "n", "name": "N", "edges": [], "is_final": True}],
+    }
+    flow_file = tmp_path / "flow.json"
+    flow_file.write_text(json.dumps(flow_data))
+    with (
+        patch.object(_cli_main_module, "_run_simple_repl") as mock_simple,
+        patch.object(_cli_main_module, "_run_chat_repl") as mock_flow,
+    ):
+        rc = main(["chat", "--flow", str(flow_file)])
+    assert rc == 0
+    mock_simple.assert_not_called()
+    mock_flow.assert_called_once()

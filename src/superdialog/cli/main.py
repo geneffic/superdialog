@@ -66,24 +66,24 @@ def _looks_like_playbook(path: str) -> bool:
     return isinstance(doc, dict) and "journeys" in doc
 
 
-def _run_playbook_repl(playbook_path: str, llm: str) -> None:
-    """Blocking interactive REPL driving a Playbook. Separated for testability.
+def _looks_like_simple_playbook(path: str) -> bool:
+    """True when ``path`` parses to a simple playbook (top-level ``playbook`` list).
 
-    One model drives both the Director and the Talker here — fine for a dev
-    REPL. Production splits them (a cheap streaming Talker, a stronger
-    Director); see :func:`superdialog.playbook.provider_adapters`.
+    Tolerant by design: any read/parse failure means "not a simple playbook" so
+    the caller falls back to the flow loader, which then reports the real error.
     """
-    from ..llm.resolver import resolve_llm
-    from ..playbook import Playbook, PlaybookAgent, httpx_http, provider_adapters
+    from ..playbook.simple import is_simple_playbook
 
-    provider = resolve_llm(llm)
-    director, talker = provider_adapters(provider)
-    agent = PlaybookAgent(
-        playbook=Playbook.load(playbook_path),
-        talker_llm=talker,
-        director_llm=director,
-        http=httpx_http,
-    )
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+        doc = yaml.safe_load(text)
+    except (OSError, yaml.YAMLError):
+        return False
+    return is_simple_playbook(doc)
+
+
+def _drive_agent(agent: Any) -> None:
+    """Run the shared async REPL loop over a PlaybookAgent."""
 
     async def _loop() -> None:
         for line in await agent.runtime.start():
@@ -116,6 +116,42 @@ def _run_playbook_repl(playbook_path: str, llm: str) -> None:
     asyncio.run(_loop())
 
 
+def _build_playbook_agent(playbook: Any, llm: str) -> Any:
+    """Build a PlaybookAgent for ``playbook`` using a single resolved model."""
+    from ..llm.resolver import resolve_llm
+    from ..playbook import PlaybookAgent, httpx_http, provider_adapters
+
+    provider = resolve_llm(llm)
+    director, talker = provider_adapters(provider)
+    return PlaybookAgent(
+        playbook=playbook,
+        talker_llm=talker,
+        director_llm=director,
+        http=httpx_http,
+    )
+
+
+def _run_playbook_repl(playbook_path: str, llm: str) -> None:
+    """Blocking interactive REPL driving a Playbook. Separated for testability.
+
+    One model drives both the Director and the Talker here — fine for a dev
+    REPL. Production splits them (a cheap streaming Talker, a stronger
+    Director); see :func:`superdialog.playbook.provider_adapters`.
+    """
+    from ..playbook import Playbook
+
+    agent = _build_playbook_agent(Playbook.load(playbook_path), llm)
+    _drive_agent(agent)
+
+
+def _run_simple_repl(simple_path: str, llm: str) -> None:
+    """Blocking interactive REPL driving a compiled simple playbook."""
+    from ..playbook.simple import load_simple
+
+    agent = _build_playbook_agent(load_simple(simple_path), llm)
+    _drive_agent(agent)
+
+
 def _cmd_chat(args: argparse.Namespace) -> int:
     """Interactive REPL over a flow or a playbook (auto-detected or explicit)."""
     load_dotenv()
@@ -129,6 +165,13 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             return 1
         return _chat_playbook(playbook_path, llm)
 
+    simple_path = getattr(args, "simple", None)
+    if simple_path:
+        if not Path(simple_path).exists():
+            print(f"No simple playbook found at: {simple_path}", file=sys.stderr)
+            return 1
+        return _chat_simple(simple_path, llm)
+
     flow_path = getattr(args, "flow", "flow.json") or "flow.json"
     if not Path(flow_path).exists():
         print(
@@ -140,6 +183,9 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     if _looks_like_playbook(flow_path):
         return _chat_playbook(flow_path, llm)
+
+    if _looks_like_simple_playbook(flow_path):
+        return _chat_simple(flow_path, llm)
 
     try:
         flow = Flow.load(flow_path)
@@ -161,6 +207,19 @@ def _chat_playbook(path: str, llm: str) -> int:
         print(f"Invalid playbook {path}: {exc}", file=sys.stderr)
         return 1
     _run_playbook_repl(path, llm)
+    return 0
+
+
+def _chat_simple(path: str, llm: str) -> int:
+    """Validate-compile a simple playbook (clean error on failure) then run it."""
+    from ..playbook.simple import load_simple
+
+    try:
+        load_simple(path)  # pre-flight: surface compile errors as one line
+    except Exception as exc:
+        print(f"Invalid simple playbook {path}: {exc}", file=sys.stderr)
+        return 1
+    _run_simple_repl(path, llm)
     return 0
 
 
@@ -296,6 +355,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--playbook",
         default=None,
         help="Path to a playbook (YAML/JSON); forces the playbook REPL",
+    )
+    chat.add_argument(
+        "--simple",
+        default=None,
+        help="Path to a simple-format playbook (YAML/JSON); compiles then runs",
     )
     chat.add_argument("--llm", default="openai/gpt-4o-mini")
     chat.add_argument(
