@@ -6,7 +6,10 @@ from pathlib import Path
 from superdialog.flow.models import ConversationFlow, Edge, FlowNode
 from superdialog.playbook.compiler import (
     FlowIndex,
+    _rewrite_template,
     compile_edge_condition,
+    compile_flow,
+    coverage_report,
     union_slot_schemas,
 )
 
@@ -208,3 +211,183 @@ def test_enum_description_and_first_declaration_wins() -> None:
     assert slots["tee_period"].description == "Preferred period"
     assert slots["count"].type == "int"
     assert requires_by_edge == {"e1": ["tee_period"], "e2": []}
+
+
+# -- full compile_flow ---------------------------------------------------------
+
+
+def test_golf_flow_compiles_to_valid_playbook() -> None:
+    pb = compile_flow(_flow())  # Playbook validators must all pass
+    assert pb.persona  # system_prompt carried over
+    assert len(pb.tools) == 25  # all global_actions
+    assert pb.handlers  # webhook + timer system nodes
+    assert pb.interrupts  # global_goodbye
+    assert pb.policies.silence  # silence nodes -> policy
+    assert pb.middleware is not None  # token_refresh -> middleware
+    assert pb.middleware.refresh_with == "action-auth-refresh"
+    assert pb.initial_checkpoint_id == "main.greeting"
+
+
+def test_every_flow_construct_is_mapped() -> None:
+    flow = _flow()
+    report = coverage_report(flow, compile_flow(flow))
+    assert report.unmapped_nodes == []
+    assert report.unmapped_edges == []
+    assert report.unmapped_actions == []
+
+
+def test_conversational_nodes_become_checkpoints() -> None:
+    pb = compile_flow(_flow())
+    ids = pb.checkpoint_ids()
+    assert any(i.endswith(".collect_booking_details") for i in ids)
+    assert any(i.endswith(".other_query_handler") for i in ids)  # it speaks
+    assert not any(i.endswith(".hold_slot_payment") for i in ids)  # computational
+    assert not any(i.endswith(".greeting_details") for i in ids)  # hub router
+    assert not any(i.endswith(".silence_check") for i in ids)  # silence policy
+    assert not any(i.endswith(".token_refresh") for i in ids)  # middleware
+
+
+def test_template_rewriting() -> None:
+    pb = compile_flow(_flow())
+    hold = pb.tool("action-slots-hold")
+    assert hold.url.startswith("{{env.API_BASE_URL}}")
+    assert any("env.ACCESS_TOKEN" in v for v in hold.headers.values())
+    assert hold.body["slot_id"] == "{{slots.slot_id}}"
+    assert hold.body["player_id"] == "{{env.player_id}}"  # env_updates key
+    assert hold.env_updates == {"hold_id": "data.hold_id"}
+    assert set(hold.args) == {"slot_id", "player_id"}
+    get_player = pb.tool("action-players-get")
+    assert get_player.when == "env.player_id"  # condition {{player_id}}
+    assert get_player.run_once is True
+
+
+def test_rewrite_template_helper() -> None:
+    env, res = {"ACCESS_TOKEN", "player_id"}, {"availability_result"}
+    rw = lambda t: _rewrite_template(t, env, res)  # noqa: E731
+    assert rw("{{ACCESS_TOKEN}}") == "{{env.ACCESS_TOKEN}}"
+    assert rw("{{city}}") == "{{slots.city}}"
+    assert (
+        rw("{{availability_result.data.slots}}")
+        == "{{results.availability_result.data.slots}}"
+    )
+    # filters: only the leading variable token is rewritten
+    assert rw("{{city|default('')}}") == "{{slots.city|default('')}}"
+    # kwargs and string literals stay untouched
+    assert (
+        rw("{{xs|selectattr('a','equalto',city)|map(attribute='b')|list}}")
+        == "{{slots.xs|selectattr('a','equalto',slots.city)|map(attribute='b')|list}}"
+    )
+    # result .success maps to the executor's .ok field
+    assert (
+        rw("{{availability_result.success|default(false)}}")
+        == "{{results.availability_result.ok|default(false)}}"
+    )
+    # statement blocks are rewritten too; keywords are preserved
+    assert (
+        rw("{% if availability_result.data.slots %}x{% endif %}")
+        == "{% if results.availability_result.data.slots %}x{% endif %}"
+    )
+    assert rw("plain text without templates") == "plain text without templates"
+
+
+def test_happy_path_rules_exist() -> None:
+    pb = compile_flow(_flow())
+    greeting = pb.checkpoint("main.greeting")
+    assert greeting.advance_when  # hub rules merged into the source
+    assert any(r.to == "main.collect_booking_details" for r in greeting.advance_when)
+    collect = pb.checkpoint("main.collect_booking_details")
+    assert any(r.to == "main.present_available_slot" for r in collect.advance_when)
+    present = pb.checkpoint("main.present_available_slot")
+    targets = {r.to for r in present.advance_when}
+    assert "main.ask_profile_details" in targets  # new caller branch
+    assert "main.collect_booking_confirmation_details" in targets  # registered
+    confirm = pb.checkpoint("main.collect_booking_confirmation_details")
+    assert any(r.to == "main.booking_close" for r in confirm.advance_when)
+    close = pb.checkpoint("main.booking_close")
+    assert close.terminal and close.outcome == "booking_close"
+    # chain on_enter tools land on the target checkpoint, in chain order
+    assert close.on_enter == ["action-slots-hold", "action-bookings-confirm"]
+    present_enter = pb.checkpoint("main.present_available_slot").on_enter
+    assert "action-courses-availability" in present_enter
+
+
+def test_silence_policy_compiled_from_silence_chain() -> None:
+    pb = compile_flow(_flow())
+    silence = pb.policies.silence
+    assert silence is not None
+    assert silence.prompts == [
+        "Hello, can you hear me?",
+        "I am unable to hear you. Are you there?",
+    ]
+    assert silence.max_prompts == 2
+    assert silence.then == "main.call_end"
+
+
+def test_handlers_wired_to_pipelines() -> None:
+    pb = compile_flow(_flow())
+    ons = {h.on for h in pb.handlers}
+    assert ons == {"webhook.payment_captured", "timer.hold_expired"}
+    webhook = next(h for h in pb.handlers if h.on.startswith("webhook."))
+    steps = pb.pipeline(webhook.pipeline).steps
+    assert [s.tool for s in steps] == ["action-bookings-confirm"]
+    timer = next(h for h in pb.handlers if h.on.startswith("timer."))
+    assert [s.tool for s in pb.pipeline(timer.pipeline).steps] == [
+        "action-slots-release"
+    ]
+
+
+def test_dispatch_compiled_from_hub_router() -> None:
+    pb = compile_flow(_flow())
+    assert len(pb.dispatch) == 13  # 14 hub edges minus the silence target
+    ids = pb.checkpoint_ids()
+    assert all(d.to in ids for d in pb.dispatch)
+    courses = next(d for d in pb.dispatch if d.to == "main.list_courses_in_city")
+    assert courses.requires == ["city"]
+
+
+def test_coverage_report_buckets() -> None:
+    flow = _flow()
+    report = coverage_report(flow, compile_flow(flow))
+    assert report.orphans == ["check_booking_status", "not_registered_close"]
+    assert "silence_check" in report.dropped["silence_policy"]
+    assert "still_silent_check" in report.dropped["silence_policy"]
+    assert "token_refresh" in report.dropped["middleware"]
+    assert "greeting_details" in report.dropped["hubs"]
+    assert any("chain-branch action placement" in n for n in report.notes)
+
+
+def test_interrupt_from_global_goodbye() -> None:
+    pb = compile_flow(_flow())
+    goodbye = next(i for i in pb.interrupts if i.id == "global_goodbye")
+    assert goodbye.to == "main.call_end"
+    assert goodbye.judge == "llm"
+    assert goodbye.resume is False
+
+
+def test_env_passes_through() -> None:
+    flow = _flow()
+    pb = compile_flow(flow)
+    assert pb.env == flow.environment_variables
+    assert pb.env["API_BASE_URL"].startswith("https://")
+
+
+def test_orphan_system_nodes_become_checkpoints() -> None:
+    pb = compile_flow(_flow())
+    status = pb.checkpoint("main.check_booking_status")
+    assert status.on_enter == ["action-booking-status-poll"]
+    assert {r.to for r in status.advance_when} == {
+        "main.booking_confirmed_close",
+        "main.booking_close_pending",
+    }
+    closed = pb.checkpoint("main.not_registered_close")
+    assert [r.to for r in closed.advance_when] == ["main.call_end"]
+
+
+def test_neutral_gloss_is_not_stripped() -> None:
+    # allowlist: only narration glosses ("route to ...") are stripped
+    rule = compile_edge_condition(
+        "hold_result.success is true — caller verified",
+        store_keys={"hold_result"},
+        target="main.t",
+    )
+    assert rule.judge == "llm"

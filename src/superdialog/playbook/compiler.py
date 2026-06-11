@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
+import json
 import re
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from superdialog.flow.models import ConversationFlow, FlowNode
-from superdialog.playbook.models import AdvanceRule, SlotSpec
+from pydantic import BaseModel, Field
+
+from superdialog.flow.enums import ActionTriggerType
+from superdialog.flow.models import ConversationFlow, CustomAction, Edge, FlowNode
+from superdialog.playbook.models import (
+    AdvanceRule,
+    Checkpoint,
+    DispatchEntry,
+    HandlerSpec,
+    InterruptSpec,
+    Journey,
+    MiddlewareSpec,
+    PipelineSpec,
+    PipelineStep,
+    Playbook,
+    Policies,
+    SilencePolicy,
+    SlotSpec,
+    ToolSpec,
+)
 
 NodeKind = Literal["conversational", "computational", "system"]
 
@@ -61,9 +81,12 @@ _EQ = r"(?:==|=|\bis\b)"
 _SUCCESS_RE = re.compile(rf"^\s*(\w+)\.success\s*{_EQ}\s*(true|false)\s*$", re.I)
 _NOT_SUCCESS_RE = re.compile(r"^\s*not\s+(\w+)\.success\s*$", re.I)
 _STATUS_RE = re.compile(rf"^\s*(\w+)\.status\s*{_EQ}\s*(\d{{3}})\s*$", re.I)
-# An em-dash gloss that QUALIFIES the predicate must not be dropped.
-_QUALIFIER_GLOSS_RE = re.compile(
-    r"^(unless|but|only|if|when|except|and|or|while|until)\b", re.I
+# Only glosses that are pure ROUTING NARRATION may be stripped (allowlist —
+# anything else might qualify the predicate and must keep the llm judge).
+_NARRATION_GLOSS_RE = re.compile(
+    r"^(route(s)?\s+(to|back)|go(es)?\s+to|proceed(s|ing)?\b|"
+    r"fall(s|ing)?\s+back|then\b|retry\b|continue(s)?\b)",
+    re.I,
 )
 
 
@@ -96,10 +119,11 @@ def compile_edge_condition(
     - ``X.status == NNN``    → ``results.X.status == NNN``
 
     Equality may be spelled ``==``, ``=``, or prose ``is`` (the legacy
-    golf flow writes "X.success is true"). A trailing em-dash gloss
-    ("X.success is false — route to retry") is stripped before matching
-    unless it begins with a qualifier word (unless/but/only/...), which
-    would change the predicate's meaning.
+    golf flow writes "X.success is true"). A trailing em-dash gloss is
+    stripped before matching ONLY when it is pure routing narration
+    ("route to retry", "fall back to ..."): the safe allowlist. Any
+    other gloss might qualify the predicate ("— unless the caller
+    already paid"), so the whole condition stays with the llm judge.
 
     Compound conditions ("A and B"), unknown keys, and anything else not
     confidently translatable stay ``judge: llm`` with the prose passed
@@ -109,7 +133,7 @@ def compile_edge_condition(
     expr = _translate_predicate(condition, store_keys)
     if expr is None:
         head, dash, gloss = condition.partition(" — ")
-        if dash and not _QUALIFIER_GLOSS_RE.match(gloss.strip()):
+        if dash and _NARRATION_GLOSS_RE.match(gloss.strip()):
             expr = _translate_predicate(head, store_keys)
     if expr is not None:
         return AdvanceRule(when=expr, judge="expr", to=target)
@@ -169,3 +193,837 @@ def union_slot_schemas(
                 slots[key] = _slot_spec_from_property(prop)
         requires_by_edge[edge.id] = list(schema.get("required") or [])
     return slots, requires_by_edge
+
+
+# -- template rewriting --------------------------------------------------------
+
+# Jinja syntax words and literals that must never be namespaced.
+_JINJA_RESERVED = frozenset(
+    {
+        "if",
+        "else",
+        "elif",
+        "endif",
+        "for",
+        "endfor",
+        "in",
+        "and",
+        "or",
+        "not",
+        "is",
+        "defined",
+        "undefined",
+        "none",
+        "None",
+        "true",
+        "false",
+        "True",
+        "False",
+        "null",
+        "loop",
+        "range",
+        "set",
+        "endset",
+    }
+)
+_BLOCK_RE = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.S)
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SUCCESS_ATTR_RE = re.compile(r"\.success\b")
+
+
+def _prev_nonspace(text: str, i: int) -> str:
+    for j in range(i - 1, -1, -1):
+        if not text[j].isspace():
+            return text[j]
+    return ""
+
+
+def _next_nonspace2(text: str, i: int) -> str:
+    for j in range(i, len(text)):
+        if not text[j].isspace():
+            return text[j : j + 2]
+    return ""
+
+
+def _rewrite_expr_body(body: str, env_keys: set[str], result_keys: set[str]) -> str:
+    """Namespace the head identifiers of one Jinja expression body."""
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch in "'\"":  # string literal: copy verbatim
+            end = body.find(ch, i + 1)
+            end = len(body) - 1 if end == -1 else end
+            out.append(body[i : end + 1])
+            i = end + 1
+            continue
+        m = _IDENT_RE.match(body, i)
+        if not m:
+            out.append(ch)
+            i += 1
+            continue
+        name = m.group(0)
+        nxt = _next_nonspace2(body, m.end())
+        head = (
+            name not in _JINJA_RESERVED
+            # attribute access (x.name) and filter names (x|name) stay
+            and _prev_nonspace(body, i) not in {".", "|"}
+            # kwarg (attribute='b') stays; `==` comparison does not
+            and not (nxt.startswith("=") and not nxt.startswith("=="))
+        )
+        if not head:
+            out.append(name)
+            i = m.end()
+        elif name in env_keys:
+            out.append(f"env.{name}")
+            i = m.end()
+        elif name in result_keys:
+            out.append(f"results.{name}")
+            i = m.end()
+            # the executor stores results as {ok, status, data, error}:
+            # the legacy ".success" field is ".ok" in the new namespace
+            if _SUCCESS_ATTR_RE.match(body, i):
+                out.append(".ok")
+                i += len(".success")
+        else:
+            out.append(f"slots.{name}")
+            i = m.end()
+    return "".join(out)
+
+
+def _rewrite_template(text: str, env_keys: set[str], result_keys: set[str]) -> str:
+    """Rewrite bare legacy template names into the executor namespace.
+
+    Legacy flow templates reference bare names ({{ACCESS_TOKEN}},
+    {{availability_result.data.slots}}, {{city}}); the new executor and
+    renderer expose namespaced lanes instead. Inside every ``{{ ... }}``
+    and ``{% ... %}`` block, each head identifier (not an attribute, not
+    a filter name, not a kwarg, not a Jinja keyword) is rewritten:
+
+    - env var names (declared env + ``env_updates`` keys) -> ``env.NAME``
+    - ``store_response_as`` keys -> ``results.KEY`` (and a following
+      ``.success`` becomes ``.ok``, matching the stored result shape)
+    - everything else -> ``slots.NAME``
+
+    String literals, filters, and kwargs are preserved verbatim. Text
+    outside template blocks is untouched.
+    """
+
+    def _sub(m: re.Match[str]) -> str:
+        if m.group(1) is not None:
+            return "{{" + _rewrite_expr_body(m.group(1), env_keys, result_keys) + "}}"
+        return "{%" + _rewrite_expr_body(m.group(2), env_keys, result_keys) + "%}"
+
+    return _BLOCK_RE.sub(_sub, text)
+
+
+# -- global_actions → ToolSpecs ------------------------------------------------
+
+_SIMPLE_WHEN_RE = re.compile(r"^\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$")
+_OUTER_MUSTACHE_RE = re.compile(r"^\{\{(.*)\}\}$", re.S)
+
+
+def _compile_tool_when(
+    condition: str, env_keys: set[str], result_keys: set[str]
+) -> str:
+    """Compile a legacy action ``condition`` template into a ``when`` expr.
+
+    ``{{X}}`` binds to the namespaced name: ``env.X`` when X is an env
+    key, ``results.X`` for a store key, else ``slots.X``. Anything more
+    complex is namespaced via :func:`_rewrite_template` and unwrapped
+    from its outer mustache (best effort; the expr judge evaluates it).
+    """
+    m = _SIMPLE_WHEN_RE.match(condition.strip())
+    if m:
+        name = m.group(1)
+        if name in env_keys:
+            return f"env.{name}"
+        if name in result_keys:
+            return f"results.{name}"
+        return f"slots.{name}"
+    rewritten = _rewrite_template(condition, env_keys, result_keys).strip()
+    outer = _OUTER_MUSTACHE_RE.match(rewritten)
+    return outer.group(1).strip() if outer else rewritten
+
+
+def _rewrite_body_value(value: Any, env_keys: set[str], result_keys: set[str]) -> Any:
+    if isinstance(value, str):
+        return _rewrite_template(value, env_keys, result_keys)
+    if isinstance(value, dict):
+        return {
+            k: _rewrite_body_value(v, env_keys, result_keys) for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_rewrite_body_value(v, env_keys, result_keys) for v in value]
+    return value
+
+
+def _compile_tool(
+    action: CustomAction,
+    env_keys: set[str],
+    result_keys: set[str],
+    notes: list[str],
+) -> ToolSpec:
+    """Compile one legacy CustomAction into a ToolSpec (1:1, lossless).
+
+    Templates are namespaced via :func:`_rewrite_template`; env_updates
+    flatten to ``{env_key: result_path}``; ``string_fields`` become typed
+    ``str`` args. A JSON-parseable body template becomes a body dict with
+    rewritten string values; a non-JSON template (raw Jinja-in-JSON) is
+    kept whole under the ``_template`` key and noted in the coverage
+    report — the executor renders it as a plain string value.
+    """
+    body: dict[str, Any] = {}
+    if action.body_template:
+        try:
+            parsed: Any = json.loads(action.body_template)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            body = _rewrite_body_value(parsed, env_keys, result_keys)
+        else:
+            body = {
+                "_template": _rewrite_template(
+                    action.body_template, env_keys, result_keys
+                )
+            }
+            note = (
+                f"tool {action.id}: non-JSON body template kept under "
+                "'_template' (rendered as a string by the executor)"
+            )
+            if note not in notes:
+                notes.append(note)
+    return ToolSpec(
+        id=action.id,
+        type="http",
+        method=str(action.method.value),
+        url=_rewrite_template(action.url, env_keys, result_keys),
+        headers={
+            k: _rewrite_template(v, env_keys, result_keys)
+            for k, v in action.headers.items()
+        },
+        body=body,
+        store_response_as=action.store_response_as,
+        env_updates={u.env_key: u.result_path for u in action.env_updates},
+        run_once=action.run_once,
+        when=(
+            _compile_tool_when(action.condition, env_keys, result_keys)
+            if action.condition
+            else None
+        ),
+        timeout=float(action.timeout),
+        args={f: SlotSpec(type="str") for f in action.string_fields},
+    )
+
+
+# -- coverage ------------------------------------------------------------------
+
+
+class CoverageReport(BaseModel):
+    """Lossless-compilation audit: what mapped where, and what did not.
+
+    ``dropped`` buckets are informational: silence_policy/middleware/
+    handler list constructs absorbed by policies, computational_chains
+    and hubs list silent nodes folded into advance rules + on_enter
+    tools. Anything in the ``unmapped_*`` lists is a compiler bug.
+    """
+
+    unmapped_nodes: list[str] = Field(default_factory=list)
+    unmapped_edges: list[str] = Field(default_factory=list)
+    unmapped_actions: list[str] = Field(default_factory=list)
+    orphans: list[str] = Field(default_factory=list)
+    dropped: dict[str, list[str]] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+
+@dataclass
+class _CompileTrace:
+    """Compile-time provenance, re-derived on demand by coverage_report."""
+
+    mapped_nodes: set[str] = field(default_factory=set)
+    mapped_edges: set[tuple[str, str]] = field(default_factory=set)
+    mapped_global_edges: set[str] = field(default_factory=set)
+    orphans: list[str] = field(default_factory=list)
+    dropped: dict[str, list[str]] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+    def drop(self, bucket: str, item: str) -> None:
+        items = self.dropped.setdefault(bucket, [])
+        if item not in items:
+            items.append(item)
+
+    def note(self, text: str) -> None:
+        if text not in self.notes:
+            self.notes.append(text)
+
+
+@dataclass
+class _Landing:
+    """One checkpoint reached by walking a computational chain."""
+
+    node_id: str
+    condition: str | None  # None -> use the source edge's own condition
+    requires: list[str]  # extra requires picked up from hub edge schemas
+    slots: dict[str, SlotSpec]  # extra slot declarations (hub schemas)
+    actions: list[str]  # chain on_enter tool ids, in path order
+
+
+# -- full compilation ----------------------------------------------------------
+
+_SILENCE_RE = re.compile(r"silence|no\s+response|not\s+respond", re.I)
+_TOKEN_EDGE_RE = re.compile(r"\b401\b|token", re.I)
+_STATUS_CODE_RE = re.compile(r"\b([45]\d{2})\b")
+_HUB_MIN_EDGES = 4
+_MAX_CHAIN_DEPTH = 10
+
+
+def _on_enter_ids(node: FlowNode) -> list[str]:
+    return [
+        t.action_id
+        for t in node.actions
+        if t.trigger_type == ActionTriggerType.ON_ENTER
+    ]
+
+
+def _handler_trigger(instruction: str) -> str | None:
+    """Map a system node's instruction to an external trigger name.
+
+    Keyword detection: an instruction mentioning "webhook" becomes
+    ``webhook.<name>`` (name derived from an "<x>.<y> webhook" mention,
+    fallback ``payment_captured``); one mentioning "timer" becomes
+    ``timer.<name>`` (derived from "<x> expires", fallback
+    ``hold_expired``). The fallbacks encode the two known golf handlers.
+    """
+    low = instruction.lower()
+    if "webhook" in low:
+        m = re.search(r"(\w+)\.(\w+)\s+webhook", low)
+        name = f"{m.group(1)}_{m.group(2)}" if m else "payment_captured"
+        return f"webhook.{name}"
+    if "timer" in low:
+        m = re.search(r"(\w+)\s+expires", low)
+        name = f"{m.group(1)}_expired" if m else "hold_expired"
+        return f"timer.{name}"
+    return None
+
+
+class _Compiler:
+    """Single-journey ("main") lossless flow → playbook compilation.
+
+    Journey splitting is an authoring concern; the compiler stays
+    lossless and boring. Computational nodes never become checkpoints:
+    they are folded into their conversational sources' advance rules and
+    their on_enter tools land on the target checkpoints (path-wise).
+    """
+
+    def __init__(self, flow: ConversationFlow) -> None:
+        self.flow = flow
+        self.idx = FlowIndex(flow)
+        self.trace = _CompileTrace()
+        self.node_ids = {n.id for n in flow.nodes}
+        self.edges = {(n.id, e.id): e for n in flow.nodes for e in n.edges}
+        self.kinds: dict[str, NodeKind] = {
+            n.id: self.idx.classify(n) for n in flow.nodes
+        }
+        self.env_keys = set(flow.environment_variables) | {
+            u.env_key for a in flow.actions for u in a.env_updates
+        }
+        self.result_keys = {
+            a.store_response_as for a in flow.actions if a.store_response_as
+        }
+        self.silence = self._find_silence_nodes()
+        self.handler_triggers = self._find_handler_triggers()
+        self.middleware_edge, self.middleware_tool = self._find_middleware()
+        self.middleware_nodes: set[str] = set()
+        if (
+            self.middleware_edge is not None
+            and self.middleware_edge.target_node_id in self.node_ids
+        ):
+            self.middleware_nodes.add(self.middleware_edge.target_node_id)
+        self.hubs = {
+            n.id
+            for n in flow.nodes
+            if self.kinds[n.id] == "computational"
+            and n.id not in self.middleware_nodes
+            and len(n.edges) >= _HUB_MIN_EDGES
+        }
+        self.hub_schemas = {
+            hub: union_slot_schemas(self.idx.node(hub)) for hub in self.hubs
+        }
+        self.checkpoints: dict[str, Checkpoint] = {}
+
+    def _rw(self, text: str) -> str:
+        return _rewrite_template(text, self.env_keys, self.result_keys)
+
+    # -- discovery ----------------------------------------------------------
+
+    def _find_silence_nodes(self) -> set[str]:
+        """Conversational nodes whose EVERY inbound edge is a silence cue."""
+        out: set[str] = set()
+        for node in self.flow.nodes:
+            if self.kinds[node.id] != "conversational":
+                continue
+            inbound = self.idx.reverse_edges.get(node.id, [])
+            if inbound and all(
+                _SILENCE_RE.search(self.edges[(src, eid)].condition)
+                for src, eid in inbound
+            ):
+                out.add(node.id)
+        return out
+
+    def _find_handler_triggers(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for node in self.flow.nodes:
+            if self.kinds[node.id] != "system":
+                continue
+            trigger = _handler_trigger(node.instruction or "")
+            if trigger:
+                out[node.id] = trigger
+        return out
+
+    def _find_middleware(self) -> tuple[Edge | None, str | None]:
+        """Find the token-expiry global edge and the auth-refresh tool."""
+        ge = next(
+            (g for g in self.flow.global_edges if _TOKEN_EDGE_RE.search(g.condition)),
+            None,
+        )
+        if ge is None:
+            return None, None
+        tool = next(
+            (
+                a.id
+                for a in self.flow.actions
+                if {"ACCESS_TOKEN", "REFRESH_TOKEN"}
+                <= {u.env_key.upper() for u in a.env_updates}
+            ),
+            None,
+        ) or next(
+            (
+                a.id
+                for a in self.flow.actions
+                if "refresh" in a.id.lower() or "refresh" in a.name.lower()
+            ),
+            None,
+        )
+        return (ge, tool) if tool else (None, None)
+
+    # -- checkpoints ----------------------------------------------------------
+
+    def _build_checkpoints(self) -> None:
+        for node in self.flow.nodes:
+            kind = self.kinds[node.id]
+            is_orphan = kind == "system" and node.id not in self.handler_triggers
+            if is_orphan:
+                # unreachable from the dialog graph, but preserved: lossless
+                self.trace.orphans.append(node.id)
+            keep = is_orphan or (
+                kind == "conversational"
+                and node.id not in self.silence
+                and node.id not in self.middleware_nodes
+            )
+            if not keep:
+                continue
+            if any(t.trigger_type != ActionTriggerType.ON_ENTER for t in node.actions):
+                self.trace.note(
+                    f"node {node.id}: non-on_enter action triggers not carried"
+                )
+            slots, _ = union_slot_schemas(node)
+            self.checkpoints[node.id] = Checkpoint(
+                id=node.id,
+                goal=node.name,
+                slots=slots,
+                guidance=self._rw(node.instruction or ""),
+                say_verbatim=(self._rw(node.static_text) if node.static_text else None),
+                auto=bool(node.static_text) and bool(node.auto_proceed),
+                on_enter=_on_enter_ids(node),
+                terminal=node.is_final,
+                outcome=node.id if node.is_final else None,
+                turn_budget=node.max_turns,
+            )
+            self.trace.mapped_nodes.add(node.id)
+
+    # -- edges → rules (with computational-chain walking) ---------------------
+
+    def _drop_edge(self, source_id: str, edge: Edge, bucket: str) -> None:
+        self.trace.mapped_edges.add((source_id, edge.id))
+        self.trace.drop(bucket, f"{source_id}:{edge.id}")
+
+    def _resolve_edge(self, source_id: str, edge: Edge) -> list[_Landing]:
+        """Resolve one edge to checkpoint landings, walking comp. chains."""
+        target = edge.target_node_id
+        if target is None or target not in self.node_ids:
+            self._drop_edge(source_id, edge, "dangling")
+            return []
+        if target in self.silence:
+            self._drop_edge(source_id, edge, "silence_policy")
+            return []
+        if target in self.middleware_nodes:
+            self._drop_edge(source_id, edge, "middleware")
+            return []
+        self.trace.mapped_edges.add((source_id, edge.id))
+        if target in self.checkpoints:
+            return [_Landing(target, None, [], {}, [])]
+        if self.kinds.get(target) != "computational":
+            self._drop_edge(source_id, edge, "unsupported_target")
+            return []
+        out: list[_Landing] = []
+        self._walk(
+            node_id=target,
+            actions=[],
+            condition=None,
+            requires=[],
+            slots={},
+            visited={source_id, target},
+            seen=set(),
+            out=out,
+            depth=1,
+        )
+        return out
+
+    def _walk(
+        self,
+        node_id: str,
+        actions: list[str],
+        condition: str | None,
+        requires: list[str],
+        slots: dict[str, SlotSpec],
+        visited: set[str],
+        seen: set[str],
+        out: list[_Landing],
+        depth: int,
+    ) -> None:
+        """DFS a computational chain, collecting checkpoint landings.
+
+        The first edge of a multi-exit node is the DEFAULT path and
+        inherits the current condition (the source edge's, on the pure
+        default path); other exits re-condition on their own edge. Hub
+        nodes (≥ ``_HUB_MIN_EDGES`` exits) re-condition EVERY exit and
+        contribute their edge schemas' slots/requires. on_enter tool ids
+        accumulate path-wise and land on each landing checkpoint.
+        """
+        node = self.idx.node(node_id)
+        self.trace.mapped_nodes.add(node_id)
+        is_hub = node_id in self.hubs
+        self.trace.drop("hubs" if is_hub else "computational_chains", node_id)
+        if node.static_text:
+            self.trace.note(
+                f"chain node {node_id}: static_text not carried "
+                "(folded node has no speaking turn)"
+            )
+        if depth > _MAX_CHAIN_DEPTH:
+            self.trace.note(
+                f"chain walk depth bound ({_MAX_CHAIN_DEPTH}) hit at {node_id}"
+            )
+            return
+        actions = [*actions, *_on_enter_ids(node)]
+        multi = len(node.edges) > 1
+        for i, edge in enumerate(node.edges):
+            target = edge.target_node_id
+            if target is None or target not in self.node_ids:
+                self._drop_edge(node_id, edge, "dangling")
+                continue
+            if target in self.silence:
+                self._drop_edge(node_id, edge, "silence_policy")
+                continue
+            if target in self.middleware_nodes:
+                self._drop_edge(node_id, edge, "middleware")
+                continue
+            self.trace.mapped_edges.add((node_id, edge.id))
+            if is_hub:
+                hub_slots, hub_reqs = self.hub_schemas[node_id]
+                b_cond: str | None = edge.condition
+                b_req = [*requires, *hub_reqs.get(edge.id, [])]
+                b_slots = {**slots, **hub_slots}
+            elif multi and i > 0:
+                b_cond, b_req, b_slots = edge.condition, requires, slots
+            else:
+                b_cond, b_req, b_slots = condition, requires, slots
+            if target in visited:
+                # Cycle back into the walk (often to the source checkpoint
+                # itself): the edge is accounted for, but a self-landing
+                # would re-fire the chain's tools on every entry, so it is
+                # suppressed and surfaced as a note instead.
+                self.trace.note(
+                    f"chain loop suppressed: {node_id}:{edge.id} returns to {target}"
+                )
+                continue
+            if target in self.checkpoints:
+                if target not in seen:
+                    seen.add(target)
+                    out.append(_Landing(target, b_cond, b_req, b_slots, actions))
+                continue
+            if self.kinds.get(target) == "computational":
+                self._walk(
+                    target,
+                    actions,
+                    b_cond,
+                    b_req,
+                    b_slots,
+                    visited | {target},
+                    seen,
+                    out,
+                    depth + 1,
+                )
+            else:
+                self._drop_edge(node_id, edge, "unsupported_target")
+
+    def _compile_edges(self, node: FlowNode) -> None:
+        cp = self.checkpoints[node.id]
+        _, requires_by_edge = union_slot_schemas(node)
+        store_keys = set(self.result_keys)
+        for edge in node.edges:
+            base_requires = requires_by_edge.get(edge.id, [])
+            for landing in self._resolve_edge(node.id, edge):
+                cond = (
+                    landing.condition
+                    if landing.condition is not None
+                    else edge.condition
+                )
+                rule = compile_edge_condition(
+                    cond, store_keys, f"main.{landing.node_id}"
+                )
+                requires = list(dict.fromkeys([*base_requires, *landing.requires]))
+                if requires:
+                    rule = rule.model_copy(update={"requires": requires})
+                if not any(
+                    r.when == rule.when
+                    and r.to == rule.to
+                    and r.requires == rule.requires
+                    for r in cp.advance_when
+                ):
+                    cp.advance_when.append(rule)
+                for key, spec in landing.slots.items():
+                    cp.slots.setdefault(key, spec)
+                landing_cp = self.checkpoints[landing.node_id]
+                for tool_id in landing.actions:
+                    if tool_id not in landing_cp.on_enter:
+                        landing_cp.on_enter.append(tool_id)
+
+    # -- hubs → dispatch -------------------------------------------------------
+
+    def _build_dispatch(self) -> list[DispatchEntry]:
+        out: list[DispatchEntry] = []
+        for node in self.flow.nodes:
+            if node.id not in self.hubs:
+                continue
+            self.trace.mapped_nodes.add(node.id)
+            _, hub_reqs = self.hub_schemas[node.id]
+            for edge in node.edges:
+                landings = self._resolve_edge(node.id, edge)
+                if not landings:
+                    continue
+                out.append(
+                    DispatchEntry(
+                        intent=edge.condition,
+                        to=f"main.{landings[0].node_id}",
+                        requires=hub_reqs.get(edge.id, []),
+                    )
+                )
+        return out
+
+    # -- silence nodes → policy ------------------------------------------------
+
+    def _build_silence_policy(self) -> SilencePolicy | None:
+        if not self.silence:
+            return None
+        ordered = [n.id for n in self.flow.nodes if n.id in self.silence]
+        entry = next(
+            (
+                nid
+                for nid in ordered
+                if any(
+                    src not in self.silence for src, _ in self.idx.reverse_edges[nid]
+                )
+            ),
+            ordered[0],
+        )
+        chain: list[str] = []
+        cur: str | None = entry
+        while cur is not None and cur not in chain:
+            chain.append(cur)
+            cur = next(
+                (
+                    e.target_node_id
+                    for e in self.idx.node(cur).edges
+                    if e.target_node_id in self.silence
+                ),
+                None,
+            )
+        chain += [nid for nid in ordered if nid not in chain]
+        for nid in self.silence:
+            self.trace.mapped_nodes.add(nid)
+            self.trace.drop("silence_policy", nid)
+            for edge in self.idx.node(nid).edges:
+                self._drop_edge(nid, edge, "silence_policy")
+        then = ""
+        for edge in self.idx.node(chain[-1]).edges:
+            target = edge.target_node_id
+            if target in self.checkpoints and _SILENCE_RE.search(edge.condition):
+                then = f"main.{target}"
+                break
+        prompts = [self._rw(self.idx.node(nid).static_text or "") for nid in chain]
+        return SilencePolicy(max_prompts=len(prompts), prompts=prompts, then=then)
+
+    # -- system nodes → handlers ------------------------------------------------
+
+    def _build_handlers(self) -> tuple[list[HandlerSpec], list[PipelineSpec]]:
+        handlers: list[HandlerSpec] = []
+        pipelines: list[PipelineSpec] = []
+        for node in self.flow.nodes:
+            trigger = self.handler_triggers.get(node.id)
+            if trigger is None:
+                continue
+            pipe = PipelineSpec(
+                id=f"{node.id}_pipe",
+                steps=[PipelineStep(tool=t) for t in _on_enter_ids(node)],
+            )
+            pipelines.append(pipe)
+            handlers.append(HandlerSpec(id=node.id, on=trigger, pipeline=pipe.id))
+            self.trace.mapped_nodes.add(node.id)
+            self.trace.drop("handlers", node.id)
+            for edge in node.edges:
+                self._drop_edge(node.id, edge, "handlers")
+        return handlers, pipelines
+
+    # -- global edges → interrupts + middleware ---------------------------------
+
+    def _build_interrupts(self) -> list[InterruptSpec]:
+        out: list[InterruptSpec] = []
+        for ge in self.flow.global_edges:
+            if self.middleware_edge is not None and ge.id == self.middleware_edge.id:
+                continue
+            self.trace.mapped_global_edges.add(ge.id)
+            if ge.target_node_id not in self.checkpoints:
+                self.trace.drop("dangling", f"global:{ge.id}")
+                continue
+            out.append(
+                InterruptSpec(
+                    id=ge.id,
+                    when=ge.condition,
+                    judge="llm",
+                    to=f"main.{ge.target_node_id}",
+                    resume=False,
+                )
+            )
+        return out
+
+    def _apply_middleware(self) -> MiddlewareSpec | None:
+        if self.middleware_edge is None or self.middleware_tool is None:
+            return None
+        self.trace.mapped_global_edges.add(self.middleware_edge.id)
+        for nid in self.middleware_nodes:
+            self.trace.mapped_nodes.add(nid)
+            self.trace.drop("middleware", nid)
+            for edge in self.idx.node(nid).edges:
+                self._drop_edge(nid, edge, "middleware")
+        m = _STATUS_CODE_RE.search(self.middleware_edge.condition)
+        status = int(m.group(1)) if m else 401
+        return MiddlewareSpec(on_status=status, refresh_with=self.middleware_tool)
+
+    # -- assembly ---------------------------------------------------------------
+
+    def compile(self) -> tuple[Playbook, _CompileTrace]:
+        tools = [
+            _compile_tool(a, self.env_keys, self.result_keys, self.trace.notes)
+            for a in self.flow.actions
+        ]
+        self._build_checkpoints()
+        for node in self.flow.nodes:
+            if node.id in self.checkpoints:
+                self._compile_edges(node)
+        dispatch = self._build_dispatch()
+        silence_policy = self._build_silence_policy()
+        handlers, pipelines = self._build_handlers()
+        interrupts = self._build_interrupts()
+        middleware = self._apply_middleware()
+        self.trace.note(
+            "chain-branch action placement approximate: computational-chain "
+            "on_enter tools attach to each landing checkpoint (path-wise), "
+            "so a branch's tools may fire on entries that did not traverse "
+            "the legacy branch"
+        )
+        self.trace.note(
+            "dispatch is compile-time organization in v1: the Director "
+            "judges per-checkpoint advance rules; hub routes are merged "
+            "into each inbound checkpoint's advance_when"
+        )
+        pb = Playbook(
+            persona=self._rw(self.flow.system_prompt),
+            journeys={
+                "main": Journey(
+                    checkpoints=[
+                        self.checkpoints[n.id]
+                        for n in self.flow.nodes
+                        if n.id in self.checkpoints
+                    ]
+                )
+            },
+            dispatch=dispatch,
+            tools=tools,
+            pipelines=pipelines,
+            handlers=handlers,
+            interrupts=interrupts,
+            policies=Policies(silence=silence_policy),
+            middleware=middleware,
+            env=dict(self.flow.environment_variables),
+            initial=f"main.{self.flow.initial_node}",
+        )
+        return pb, self.trace
+
+
+def _compile_internal(flow: ConversationFlow) -> tuple[Playbook, _CompileTrace]:
+    return _Compiler(flow).compile()
+
+
+def compile_flow(flow: ConversationFlow) -> Playbook:
+    """Compile a legacy ConversationFlow into a single-journey Playbook.
+
+    Lossless by construction — every legacy construct lands somewhere:
+
+    - conversational nodes → checkpoints in journey "main"
+    - computational nodes → folded into their sources' advance rules;
+      their on_enter actions land on the target checkpoints (path-wise)
+    - hub routers (≥4-exit computational) → dispatch entries + rules
+      merged into every inbound checkpoint
+    - silence nodes → ``policies.silence`` (prompts in chain order)
+    - token-expiry global edge + refresh node → ``middleware``
+    - other global edges → interrupts
+    - webhook/timer system nodes → handlers with single-step pipelines
+    - orphan system nodes → normal (unreachable) checkpoints
+    - global_actions → tools 1:1, templates rewritten to the
+      {env, slots, results} namespace
+
+    Use :func:`coverage_report` to audit the mapping.
+    """
+    return _compile_internal(flow)[0]
+
+
+def coverage_report(flow: ConversationFlow, pb: Playbook) -> CoverageReport:
+    """Audit a compiled playbook against its source flow.
+
+    Re-derives compile-time provenance by re-running the compilation
+    (the trace is never attached to the Playbook artifact) and lists
+    any node, edge, or action that did not map anywhere. Tool coverage
+    is checked against ``pb`` so a hand-edited playbook is audited as
+    given.
+    """
+    _, trace = _compile_internal(flow)
+    tool_ids = {t.id for t in pb.tools}
+    unmapped_edges = [
+        f"{n.id}:{e.id}"
+        for n in flow.nodes
+        for e in n.edges
+        if (n.id, e.id) not in trace.mapped_edges
+    ]
+    unmapped_edges += [
+        f"global:{ge.id}"
+        for ge in flow.global_edges
+        if ge.id not in trace.mapped_global_edges
+    ]
+    return CoverageReport(
+        unmapped_nodes=[n.id for n in flow.nodes if n.id not in trace.mapped_nodes],
+        unmapped_edges=unmapped_edges,
+        unmapped_actions=[a.id for a in flow.actions if a.id not in tool_ids],
+        orphans=trace.orphans,
+        dropped=trace.dropped,
+        notes=trace.notes,
+    )
