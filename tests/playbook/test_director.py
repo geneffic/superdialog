@@ -1,4 +1,5 @@
 import json
+import textwrap
 
 from superdialog.playbook.director import Director
 from superdialog.playbook.events import (
@@ -9,7 +10,7 @@ from superdialog.playbook.events import (
     UtteranceEvent,
 )
 from superdialog.playbook.models import Playbook
-from superdialog.playbook.state import ConversationState
+from superdialog.playbook.state import ConversationState, SlotValue
 from tests.playbook.test_models import MINIMAL_YAML
 
 
@@ -126,3 +127,120 @@ async def test_malformed_llm_json_yields_degraded() -> None:
 
     decision = await Director(pb, BadLLM()).evaluate(state)
     assert decision.events == [] and decision.degraded
+    assert decision.detail == "json_parse_error"
+
+
+async def test_degraded_detail_distinguishes_failure_modes() -> None:
+    pb, state = _state()
+
+    class RaisingLLM:
+        async def complete(self, messages, **kwargs) -> str:
+            raise RuntimeError("boom")
+
+    class ListLLM:
+        async def complete(self, messages, **kwargs) -> str:
+            return "[1, 2]"
+
+    assert (await Director(pb, RaisingLLM()).evaluate(state)).detail == "llm_error"
+    assert (await Director(pb, ListLLM()).evaluate(state)).detail == "non_dict_verdict"
+
+
+HARD_GATE_YAML = textwrap.dedent("""
+    persona: "You verify payments."
+    journeys:
+      pay:
+        checkpoints:
+          - id: verify
+            gate: hard
+            goal: "Verify the one-time code"
+            slots:
+              otp: {type: str}
+            advance_when:
+              - {when: "user gave the code", judge: llm, to: pay.done,
+                 requires: [otp]}
+          - id: done
+            terminal: true
+""")
+
+
+def _hard_state(pb: Playbook) -> ConversationState:
+    log = EventLog()
+    log.append(
+        AdvanceEvent(from_checkpoint=None, to_checkpoint="pay.verify", rule="init")
+    )
+    log.append(UtteranceEvent(role="user", text="my code is 4242"))
+    return ConversationState.fold(log, playbook=pb)
+
+
+async def test_hard_gate_not_self_attesting() -> None:
+    """A single verdict must not confirm its own requires through a hard gate."""
+    pb = Playbook.from_yaml(HARD_GATE_YAML)
+    state = _hard_state(pb)
+    llm = CannedLLM({"slots": {"otp": "4242"}, "advance": "pay.done", "note": None})
+    decision = await Director(pb, llm).evaluate(state)
+    assert not [e for e in decision.events if isinstance(e, AdvanceEvent)]
+    writes = [e for e in decision.events if isinstance(e, SlotWriteEvent)]
+    assert writes and writes[0].key == "otp"
+    assert writes[0].status == "provisional"
+    notes = [e for e in decision.events if e.type == "steering_note"]
+    assert notes and "confirmation" in notes[0].text and "otp" in notes[0].text
+
+
+async def test_hard_gate_advances_once_slot_confirmed() -> None:
+    """Pre-confirmed requires (e.g. by a tool) do let the verdict advance."""
+    pb = Playbook.from_yaml(HARD_GATE_YAML)
+    state = _hard_state(pb)
+    state.slots["otp"] = SlotValue(
+        value="4242", status="confirmed", by="tool", version=1
+    )
+    llm = CannedLLM({"slots": {}, "advance": "pay.done", "note": None})
+    decision = await Director(pb, llm).evaluate(state)
+    adv = [e for e in decision.events if isinstance(e, AdvanceEvent)]
+    assert adv and adv[0].to_checkpoint == "pay.done"
+
+
+async def test_authoritative_slots_never_written_by_verdict() -> None:
+    pb, state = _state()
+    llm = CannedLLM(
+        {"slots": {"price": 1200.0, "city": "Pune"}, "advance": None, "note": None}
+    )
+    decision = await Director(pb, llm).evaluate(state)
+    writes = [e for e in decision.events if isinstance(e, SlotWriteEvent)]
+    assert not [e for e in writes if e.key == "price"]  # authoritative: tool-only
+    assert [e for e in writes if e.key == "city"]
+
+
+TYPED_SLOTS_YAML = textwrap.dedent("""
+    journeys:
+      j:
+        checkpoints:
+          - id: c
+            slots:
+              mode: {type: enum, values: [a, b]}
+              count: {type: int}
+          - id: end
+            terminal: true
+""")
+
+
+async def test_enum_and_type_validation() -> None:
+    pb = Playbook.from_yaml(TYPED_SLOTS_YAML)
+    log = EventLog()
+    log.append(AdvanceEvent(from_checkpoint=None, to_checkpoint="j.c", rule="init"))
+    log.append(UtteranceEvent(role="user", text="seven, mode c"))
+    state = ConversationState.fold(log, playbook=pb)
+    llm = CannedLLM(
+        {"slots": {"mode": "c", "count": "7"}, "advance": None, "note": None}
+    )
+    decision = await Director(pb, llm).evaluate(state)
+    writes = {e.key: e for e in decision.events if isinstance(e, SlotWriteEvent)}
+    assert "mode" not in writes  # "c" is not an enum member of [a, b]
+    assert writes["count"].value == 7 and isinstance(writes["count"].value, int)
+
+
+async def test_verdict_prompt_warns_against_injection() -> None:
+    pb, state = _state()
+    llm = CannedLLM({"slots": {}, "advance": None, "note": None})
+    await Director(pb, llm).evaluate(state)
+    system = llm.calls[0][0]["content"]
+    assert "untrusted" in system

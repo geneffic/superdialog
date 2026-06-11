@@ -154,6 +154,26 @@ def test_retry_spec_capped() -> None:
     assert RetrySpec(retry=10).retry == 10
 
 
+def test_requires_keys_validated() -> None:
+    bad = MINIMAL_YAML.replace("requires: [city, date]", "requires: [city, datex]")
+    with pytest.raises(ValueError, match="datex"):
+        Playbook.from_yaml(bad)
+    # a requires key set by the SAME rule's `set:` is allowed
+    ok = textwrap.dedent("""
+        journeys:
+          j:
+            checkpoints:
+              - id: a
+                advance_when:
+                  - {when: "true", judge: expr, to: j.b,
+                     requires: [flag], set: {flag: true}}
+              - id: b
+                terminal: true
+    """)
+    pb = Playbook.from_yaml(ok)
+    assert pb.checkpoint("j.a").advance_when[0].requires == ["flag"]
+
+
 def test_dotted_journey_name_rejected() -> None:
     with pytest.raises(ValueError, match=r"a\.b"):
         Playbook.from_yaml(

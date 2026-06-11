@@ -234,10 +234,25 @@ class Playbook(BaseModel):
             if ref not in ids:
                 raise ValueError(f"{ctx}: unknown checkpoint {ref!r}")
 
+        # A typo'd requires key at a hard gate would deadlock the checkpoint:
+        # every key must be declared on some checkpoint or set by its own rule.
+        declared_slots = {
+            key
+            for j in self.journeys.values()
+            for cp in j.checkpoints
+            for key in cp.slots
+        }
         for jname, j in self.journeys.items():
             for cp in j.checkpoints:
                 for rule in cp.advance_when:
                     need_cp(rule.to, f"{jname}.{cp.id} advance_when")
+                    for req in rule.requires:
+                        if req not in declared_slots and req not in rule.set:
+                            raise ValueError(
+                                f"{jname}.{cp.id} advance_when: requires key "
+                                f"{req!r} is not declared in any checkpoint's "
+                                "slots nor set by the rule"
+                            )
                 if cp.pipeline and cp.pipeline not in pipeline_ids:
                     raise ValueError(
                         f"{jname}.{cp.id}: unknown pipeline {cp.pipeline!r}"
