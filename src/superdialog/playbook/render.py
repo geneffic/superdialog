@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from jinja2 import TemplateError, Undefined
+from jinja2 import ChainableUndefined, TemplateError
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel, Field
 
@@ -20,7 +20,10 @@ from .state import ConversationState
 
 # Sandboxed: templates come from playbook artifacts (optimizer-generated),
 # so attribute-walking SSTI payloads must be blocked, not executed.
-_jinja = SandboxedEnvironment(undefined=Undefined, autoescape=False)
+# ChainableUndefined: compiled flows chain through possibly-missing results
+# ({{ results.x.data.name|default('there') }}) — attribute access on a
+# missing root must defer to the |default filter, not raise mid-speech.
+_jinja = SandboxedEnvironment(undefined=ChainableUndefined, autoescape=False)
 
 
 def estimate_tokens(text: str) -> int:

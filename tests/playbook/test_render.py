@@ -87,11 +87,18 @@ def test_template_errors_degrade_to_raw_text() -> None:
     pb, state = _setup()
     cp = pb.checkpoint("booking.collect")
 
-    cp.guidance = "Hi {{ env.X }}"  # UndefinedError: env is not in the namespace
+    # ChainableUndefined: missing roots render empty (never raw, never raise)
+    cp.guidance = "Hi {{ env.X }} there"
     view = render_view(pb, state, token_budget=10_000)
-    assert "{{ env.X }}" in view.messages[0]["content"]
+    assert "Hi  there" in view.messages[0]["content"]
+    assert "{{" not in view.messages[0]["content"]
 
-    cp.guidance = "broken {{ slots."  # TemplateSyntaxError
+    # chained access through missing results defers to |default
+    cp.guidance = "Hello {{ results.missing.data.name|default('friend') }}"
+    view = render_view(pb, state, token_budget=10_000)
+    assert "Hello friend" in view.messages[0]["content"]
+
+    cp.guidance = "broken {{ slots."  # TemplateSyntaxError -> raw text
     view = render_view(pb, state, token_budget=10_000)
     assert "broken {{ slots." in view.messages[0]["content"]
 
