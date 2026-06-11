@@ -1,4 +1,5 @@
 import textwrap
+from pathlib import Path
 
 
 from superdialog.playbook.models import Playbook
@@ -178,3 +179,53 @@ def test_single_step_playbook_is_terminal_with_no_rules() -> None:
     )
     only = pb.checkpoint("main.only")
     assert only.terminal is True and only.advance_when == []
+
+
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "playbooks"
+EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "playbooks"
+
+
+def test_golden_fixture_compiles_and_validates() -> None:
+    from superdialog.playbook.simple import load_simple
+
+    pb = load_simple(str(FIXTURES / "simple_booking.yaml"))
+    ids = pb.checkpoint_ids()
+    assert ids == {
+        "main.greeting",
+        "main.collect_details",
+        "main.present_price",
+        "main.confirm_booking",
+    }
+    cd = pb.checkpoint("main.collect_details")
+    assert set(cd.slots) == {"name", "service"}
+    assert cd.advance_when[0].requires == ["name", "service"]
+    assert cd.advance_when[0].to == "main.present_price"
+    assert pb.checkpoint("main.confirm_booking").terminal is True
+    assert "## Reference facts" in pb.persona
+    assert "canonical_pricing" in pb.persona and "₹400" in pb.persona
+    assert "## Objection handling" in pb.persona
+    assert "If Caller says the price is too high. ->" in pb.persona
+    assert "## Hard boundaries" in pb.persona
+    assert "NEVER invent prices" in pb.persona
+    assert pb.env == {}
+
+
+def test_golden_fixture_round_trips_through_from_yaml() -> None:
+    import yaml
+
+    from superdialog.playbook.simple import load_simple
+
+    pb = load_simple(str(FIXTURES / "simple_booking.yaml"))
+    dumped = yaml.safe_dump(pb.model_dump(mode="json"), sort_keys=False)
+    reloaded = Playbook.from_yaml(dumped)
+    assert reloaded.checkpoint_ids() == pb.checkpoint_ids()
+
+
+def test_realestate_simple_example_compiles() -> None:
+    from superdialog.playbook.simple import load_simple
+
+    pb = load_simple(str(EXAMPLES / "realestate_site_visit.simple.yaml"))
+    assert isinstance(pb, Playbook)
+    assert "main.deliver_closing" in pb.checkpoint_ids()
+    assert pb.checkpoint("main.deliver_closing").terminal is True
+    assert "Hard boundaries" in pb.persona
