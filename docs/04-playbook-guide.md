@@ -456,7 +456,48 @@ For LLM-free unit tests, fold logs directly: `ConversationState.fold(log,
 playbook)` is a pure function, as are the expr evaluator, the renderer, and
 the compiler.
 
-## 7. Roadmap
+## 8. Simple authoring format
+
+The simple format is the easiest way to author a playbook: prose steps, a
+nested persona, and reference data (facts, objections, boundaries, fallbacks).
+`load_simple(path)` (or `superdialog chat --simple PATH`) compiles it to a
+`Playbook` — the same validated artifact `compile_flow` produces from flows, so
+it runs on the same Talker/Director runtime. v1 supports linear step sequences
+only.
+
+```yaml
+name: "Tiny Booking Bot"
+goal: "Book a haircut and confirm it."
+persona:
+  identity: "You are Mira, a booking assistant for Glow Studio."
+  voice_style: "Warm and brief. One question at a time."
+playbook:
+  - {id: greet, purpose: "Open the call.", say: "Greet and ask how you can help.", done_when: "Caller is ready to book."}
+  - {id: collect, purpose: "Get details.", say: "Ask for their name and service.", collect: [name, service], done_when: "Name and service captured."}
+  - {id: confirm, purpose: "Confirm and close.", say: "Read back the booking and confirm.", done_when: "Caller confirmed."}
+facts:
+  canonical_pricing: {haircut: "₹400"}
+objections:
+  - {trigger: "Caller says it's too expensive.", handle: "Acknowledge and offer the cheapest option."}
+boundaries: ["NEVER invent prices."]
+```
+
+| Simple key | Compiles to |
+| --- | --- |
+| `persona.identity` + `voice_style` + `goal` + `facts` + `objections` + `boundaries` + `fallback_actions` + `closing` | one rich `Playbook.persona` string |
+| each `playbook` step | a `Checkpoint` in journey `main` |
+| `step.id` | checkpoint id |
+| `step.purpose` | `checkpoint.goal` |
+| `step.say` | `checkpoint.guidance` |
+| `step.collect` | `str` slots + the step rule's `requires` |
+| `step.done_when` | the step's single `judge: llm` advance rule `when`, `to` the next step |
+| last step | `terminal: true`, `outcome: closed` |
+| `opening` | seeds the first step's guidance only if it has no `say` |
+
+What's NOT in v1: linear step sequences only; objections live in persona prose
+(not interrupts); all collected slots are `str`. See the plan's deferred list.
+
+## 9. Roadmap
 
 Clearly future, not in this release: a `superdialog optimize` command that
 consumes `EvalReport`s in a reflective improvement loop; voice-event

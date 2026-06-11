@@ -229,3 +229,15 @@ def test_realestate_simple_example_compiles() -> None:
     assert "main.deliver_closing" in pb.checkpoint_ids()
     assert pb.checkpoint("main.deliver_closing").terminal is True
     assert "Hard boundaries" in pb.persona
+
+
+def test_public_exports() -> None:
+    from superdialog.playbook import (
+        is_simple_playbook,
+        load_simple,
+        simple_to_playbook,
+    )
+
+    assert callable(is_simple_playbook)
+    assert callable(load_simple)
+    assert callable(simple_to_playbook)

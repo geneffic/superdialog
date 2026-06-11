@@ -134,11 +134,13 @@ plain text, `(await provider.complete(messages)).text`; the Talker wants raw
 tokens, `chunk.text` from `provider.stream(messages)`.)
 
 Or skip the Python and chat against the playbook from the CLI — `chat` runs
-either engine, auto-detecting a playbook by its top-level `journeys` key:
+either engine, auto-detecting a playbook by its top-level `journeys` key, or a
+simple playbook by its top-level `playbook` list:
 
 ```bash
 superdialog chat --playbook booking.yaml     # explicit
 superdialog chat --flow booking.yaml         # auto-detected as a playbook
+superdialog chat --simple intake.yaml         # simple format -> compiled playbook
 superdialog chat --flow appointment.json     # a flow graph -> DialogMachine
 ```
 
