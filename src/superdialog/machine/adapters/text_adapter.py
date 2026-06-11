@@ -96,6 +96,7 @@ class TextAdapter:
         node: FlowNode,
         history: list[dict[str, Any]],
         userdata: dict[str, Any],
+        silent: bool = False,
     ) -> CriteriaResult:
         """Evaluate node completion via CriteriaJudge."""
         # Extract flow metadata injected by DialogStateMachine

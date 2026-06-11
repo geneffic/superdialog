@@ -41,6 +41,7 @@ class MockAdapter:
         node: FlowNode,
         history: list[dict[str, Any]],
         userdata: dict[str, Any],
+        silent: bool = False,
     ) -> CriteriaResult:
         """Return the next edge in the sequence."""
         if self._index < len(self._edge_sequence):
@@ -108,6 +109,7 @@ class MockAdapterWithCriteria:
         node: FlowNode,
         history: list[dict[str, Any]],
         userdata: dict[str, Any],
+        silent: bool = False,
     ) -> CriteriaResult:
         """Return the fixed criteria result."""
         return CriteriaResult(

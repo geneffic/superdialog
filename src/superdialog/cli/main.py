@@ -187,6 +187,44 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_eval(args: argparse.Namespace) -> int:
+    """Run eval against a flow — audit mode (with --traversal) or synthetic mode."""
+    load_dotenv()
+    from superdialog.machine.eval import run_eval
+    from superdialog.machine.eval.models import AuditReport, EvalReport
+
+    traversal = getattr(args, "traversal", None)
+    model = getattr(args, "model", "gpt-4.1-mini") or "gpt-4.1-mini"
+
+    print(f"Running eval: flow={args.flow} model={model}", file=sys.stderr)
+    if traversal:
+        print(f"Mode: audit  traversal={traversal}", file=sys.stderr)
+    else:
+        print("Mode: synthetic (generating corpus)", file=sys.stderr)
+
+    report = asyncio.run(run_eval(
+        flow_path=args.flow,
+        traversal_path=traversal,
+        model=model,
+    ))
+
+    if isinstance(report, AuditReport):
+        print(report.to_markdown())
+        return 0 if report.overall_score >= 0.0 else 1
+
+    # EvalReport
+    for score in report.models:
+        print(f"\n{'='*50}")
+        print(f"Model:              {score.model_id}")
+        print(f"Edge accuracy:      {score.edge_accuracy:.1%}")
+        print(f"Persona completion: {score.persona_completion:.1%}")
+        if score.failures:
+            print(f"\nFailures ({len(score.failures)}):")
+            for f in score.failures:
+                print(f"  - {f}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="superdialog")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -240,6 +278,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     generate.add_argument("--llm", default="openai/gpt-4o-mini")
     generate.set_defaults(fn=_cmd_generate)
+
+    eval_cmd = sub.add_parser(
+        "eval",
+        help="Eval a flow: audit real session (--traversal) or run synthetic corpus",
+    )
+    eval_cmd.add_argument("--flow", required=True, help="Path to flow JSON")
+    eval_cmd.add_argument(
+        "--traversal",
+        default=None,
+        help="Path to traversal JSON (audit mode). Omit for synthetic eval.",
+    )
+    eval_cmd.add_argument(
+        "--model",
+        default="gpt-4.1-mini",
+        help="OpenAI model for eval LLM (default: gpt-4.1-mini)",
+    )
+    eval_cmd.set_defaults(fn=_cmd_eval)
 
     return parser
 

@@ -42,7 +42,7 @@ class LLMCallData:
 #   EN line: '...' / HI line: '...'  — line format used in new BOB flows
 
 _LANG_LINE_RE = re.compile(
-    r"(?:^|\n)\s*(?P<lang>[A-Za-z]{2})\s+line\s*:\s*['\"](.+?)['\"]",
+    r"(?:^|\n)\s*(?P<lang>[A-Za-z]{2})\s+line\s*:\s*['\"](.+)['\"][ \t]*$",
     re.MULTILINE,
 )
 
@@ -76,6 +76,13 @@ if TYPE_CHECKING:
     from superdialog.flow.models import CustomAction, FlowNode
 
 logger = logging.getLogger(__name__)
+
+# Deterministic router-condition grammar. Only the safe, data-decidable shapes
+# below are evaluated without the LLM; anything else (prose / judged conditions)
+# is left to the LLM router. Conservative by design — a miss just falls back.
+_GUARD_CMP_RE = re.compile(r"^([\w][\w.]*)\s*(==|!=)\s*(.+)$")
+# Trailing prose after an em/en-dash, " - ", or comma is advisory, not logic.
+_GUARD_PROSE_SPLIT_RE = re.compile(r"\s+[—–]\s+|\s+-\s+|,")
 
 
 def _livekit_inference_url() -> str:
@@ -218,6 +225,8 @@ def _extract_for_language(instruction: str, lang: str) -> str | None:
     for m in _LANG_LINE_RE.finditer(instruction):
         if m.group("lang").upper() == target:
             text = _strip_routing_metadata(m.group(2).strip())
+            # Unescape doubled single-quotes (flow JSON escapes ' as '' inside '...')
+            text = text.replace("''", "'")
             if text:
                 return text
 
@@ -364,6 +373,117 @@ class ToolCallAdapter:
         ctx.update(self._env_vars)
         ctx.update(userdata)
         return ctx
+
+    # ------------------------------------------------------------------
+    # Deterministic routing (data-decidable edges, zero LLM)
+    # ------------------------------------------------------------------
+
+    def _parse_clause(self, clause: str) -> str | None:
+        """Translate ONE simple predicate to a Jinja boolean, or None.
+
+        Bool/empty predicates are anchored at the start so trailing advisory
+        prose ("... is false after retry") is ignored. ``==``/``!=`` require a
+        full-string literal comparison (no trailing prose, no variable RHS)."""
+        c = clause.strip()
+        m = re.match(r"([\w.]+)\s+is\s+not\s+empty\b", c, re.IGNORECASE)
+        if m:
+            return f"({m.group(1)})"
+        m = re.match(r"([\w.]+)\s+is\s+non-?empty\b", c, re.IGNORECASE)
+        if m:
+            return f"({m.group(1)})"
+        m = re.match(r"([\w.]+)\s+is\s+empty\b", c, re.IGNORECASE)
+        if m:
+            return f"(not ({m.group(1)}))"
+        m = re.match(r"([\w.]+)\s+is\s+(true|false)\b", c, re.IGNORECASE)
+        if m:
+            return f"({m.group(1)}) == {m.group(2).lower()}"
+        m = _GUARD_CMP_RE.fullmatch(c)
+        if m:
+            rhs = m.group(3).strip()
+            # Literal RHS only — never another variable, which could hide logic.
+            if re.fullmatch(r"(['\"]).*\1|-?\d+(\.\d+)?|true|false", rhs, re.IGNORECASE):
+                return f"({m.group(1)}) {m.group(2)} {rhs}"
+        return None
+
+    def _condition_to_jinja(self, condition: str) -> str | None:
+        """Translate a safe edge condition into a Jinja boolean expression, or
+        None for anything outside the grammar (prose / LLM-judged) so the
+        caller falls back to the LLM router.
+
+        Supports single predicates and ``and``/``or`` chains of them — every
+        clause must parse, otherwise the whole condition is treated as prose
+        (defer). This keeps prose routers from ever misfiring."""
+        if not condition:
+            return None
+        # Drop trailing advisory prose ("... — route to retry attempt").
+        head = _GUARD_PROSE_SPLIT_RE.split(condition.strip(), maxsplit=1)[0].strip()
+        # Compound: try `or` first, then `and`. Mixed/unparsable clauses → defer.
+        for sep, joiner in ((r"\s+\bor\b\s+", " or "), (r"\s+\band\b\s+", " and ")):
+            parts = re.split(sep, head, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                subs = [self._parse_clause(p) for p in parts]
+                if all(subs):
+                    return "(" + joiner.join(subs) + ")"
+                return None
+        return self._parse_clause(head)
+
+    def _eval_jinja_bool(self, expr: str, ctx: dict[str, Any]) -> bool | None:
+        """Render a Jinja boolean expression to True/False, or None on error."""
+        try:
+            out = (
+                self._jinja_env.from_string(
+                    "{% if " + expr + " %}1{% else %}0{% endif %}"
+                )
+                .render(**ctx)
+                .strip()
+            )
+        except Exception as exc:
+            logger.debug("guard eval failed for %r: %s", expr[:60], exc)
+            return None
+        if out == "1":
+            return True
+        if out == "0":
+            return False
+        return None
+
+    def _eval_condition_bool(
+        self, condition: str, ctx: dict[str, Any]
+    ) -> bool | None:
+        """Evaluate an edge condition to True/False, or None if indeterminate."""
+        expr = self._condition_to_jinja(condition)
+        if expr is None:
+            return None
+        return self._eval_jinja_bool(expr, ctx)
+
+    def deterministic_route(
+        self, node: "FlowNode", userdata: dict[str, Any]
+    ) -> str | None:
+        """Return the single edge id that data unambiguously satisfies, or
+        None to defer to the LLM router.
+
+        Fires ONLY when every outgoing edge is decidable from data AND exactly
+        one is true — so an LLM/judged edge mixed in always defers. This makes
+        data-settled transitions (e.g. ``success is true``) immune to the
+        non-deterministic LLM routing that otherwise stalls silent routers.
+
+        Each edge is decided by its explicit ``guard`` (a raw Jinja boolean) if
+        present, else by parsing its prose ``condition``."""
+        edges = getattr(node, "edges", None) or []
+        if len(edges) < 2:
+            return None
+        ctx = self._build_context(userdata)
+        results: dict[str, bool | None] = {}
+        for e in edges:
+            guard = getattr(e, "guard", None)
+            results[e.id] = (
+                self._eval_jinja_bool(guard, ctx)
+                if guard
+                else self._eval_condition_bool(e.condition, ctx)
+            )
+        if any(v is None for v in results.values()):
+            return None  # some edge is prose/indeterminate — defer to LLM
+        trues = [eid for eid, v in results.items() if v]
+        return trues[0] if len(trues) == 1 else None
 
     # ------------------------------------------------------------------
     # Instruction builder
@@ -558,8 +678,16 @@ class ToolCallAdapter:
         node: FlowNode,
         history: list[dict[str, Any]],
         userdata: dict[str, Any],
+        silent: bool = False,
     ) -> CriteriaResult:
-        """Evaluate via LLM tool-calling (streaming for early edge_id detection)."""
+        """Evaluate via LLM tool-calling (streaming for early edge_id detection).
+
+        ``silent=True`` marks a silent auto-chain routing pass (no new user
+        turn). In that mode the stay-hatch + ROUTING RULE are reframed around
+        DATA/state instead of "did the caller answer my question" — otherwise
+        the LLM false-stays when the trailing history looks unrelated to this
+        (silent) node, stalling the router chain.
+        """
         machine = self._machine
 
         # Build tool schemas from descriptors
@@ -587,25 +715,41 @@ class ToolCallAdapter:
         # ambiguous input to a real edge. tool_choice="required" means the LLM
         # MUST call something — without this it picks the closest-sounding edge
         # even when none are satisfied (compliments, off-topic, partial sentences).
+        # In silent auto-chain mode there is NO new caller turn, so the hatch is
+        # reframed around DATA/state: stay only when the data/instruction does
+        # not yet decide an edge — NOT because "the caller didn't answer".
+        if silent:
+            _stay_description = (
+                "Call this ONLY when the current DATA and node instruction do "
+                "NOT yet satisfy ANY listed edge condition — i.e. the node is "
+                "genuinely waiting for information that has not arrived yet "
+                "(e.g. no slot chosen, a required field still empty). "
+                "There is NO new caller message in this pass, so do NOT stay "
+                "merely because 'the caller hasn't answered' — evaluate the "
+                "DATA. If the data already satisfies an edge, CALL THAT EDGE, "
+                "not this. Leave brief_response empty."
+            )
+        else:
+            _stay_description = (
+                "Call this when the caller's response does NOT clearly and "
+                "unambiguously satisfy ANY of the listed edge conditions. "
+                "ALWAYS call this for: (1) asking agent to repeat/re-read "
+                "information ('address बताइए', 'फिर से बोलिए', 'what did you say', "
+                "'tell me again', 'didn't hear', 'repeat'); "
+                "(2) ambiguous/off-topic input, compliment, filler, partial sentence; "
+                "(3) 'no' as a correction not a goodbye; "
+                "(4) any question about what was just said. "
+                "Staying is ALWAYS safer than a wrong transition. When in doubt — stay. "
+                "IMPORTANT: set brief_response to a SHORT contextual reply "
+                "(1-2 sentences max). If caller asked to repeat specific info, "
+                "repeat ONLY that info. If caller asked a clarifying question, "
+                "answer briefly. Do NOT repeat the full agent turn."
+            )
         tools.append({
             "type": "function",
             "function": {
                 "name": "__stay_on_node__",
-                "description": (
-                    "Call this when the caller's response does NOT clearly and "
-                    "unambiguously satisfy ANY of the listed edge conditions. "
-                    "ALWAYS call this for: (1) asking agent to repeat/re-read "
-                    "information ('address बताइए', 'फिर से बोलिए', 'what did you say', "
-                    "'tell me again', 'didn't hear', 'repeat'); "
-                    "(2) ambiguous/off-topic input, compliment, filler, partial sentence; "
-                    "(3) 'no' as a correction not a goodbye; "
-                    "(4) any question about what was just said. "
-                    "Staying is ALWAYS safer than a wrong transition. When in doubt — stay. "
-                    "IMPORTANT: set brief_response to a SHORT contextual reply "
-                    "(1-2 sentences max). If caller asked to repeat specific info, "
-                    "repeat ONLY that info. If caller asked a clarifying question, "
-                    "answer briefly. Do NOT repeat the full agent turn."
-                ),
+                "description": _stay_description,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -627,34 +771,61 @@ class ToolCallAdapter:
             self._build_instructions(node, machine) if machine else self._system_prompt
         )
 
-        # Prepend routing discipline so LLM prefers __stay_on_node__ over false matches
-        _routing_rule = (
-            "ROUTING RULE: Call __stay_on_node__ unless the caller's message "
-            "CLEARLY and UNAMBIGUOUSLY satisfies one specific edge condition. "
-            "MANDATORY __stay_on_node__ cases:\n"
-            "- CONTEXT MISMATCH: caller says something that has nothing to do with "
-            "the agent's current question (e.g. agent asked 'can we talk?' and "
-            "caller says a year/number; agent asked yes/no and caller gave unrelated "
-            "data; the input makes no sense as an answer to the current question)\n"
-            "- Asking agent to repeat/re-read ('address बताइए', 'फिर से बोलिए', "
-            "'didn't hear', 'what was that', 'tell me again')\n"
-            "- Compliments, tangents, frustration outbursts, filler, testing phrases\n"
-            "- Partial or cut-off sentences\n"
-            "- 'no' as a correction not a goodbye\n"
-            "- 'thank you for confirming' — NOT a card receipt confirmation\n"
-            "- Any response that doesn't directly answer the agent's current question\n"
-            "OBJECTIVE RULE: Always complete the current node's objective before "
-            "transitioning. If the caller's response doesn't fulfill the objective, stay.\n"
-            "Never force-fit an off-topic response to the closest-sounding edge."
-        )
+        # Prepend routing discipline so LLM prefers __stay_on_node__ over false matches.
+        # Silent auto-chain pass: the caller-message framing is meaningless (no new
+        # caller turn). Route on DATA + node instruction; stay only if data is
+        # genuinely not ready. The "doesn't answer my question -> stay" rule is what
+        # false-stalls silent routers, so it is dropped here.
+        if silent:
+            _routing_rule = (
+                "ROUTING RULE (silent routing pass — NO new caller message): "
+                "Decide the edge purely from the [CURRENT DATA] and the node "
+                "instruction. If the data satisfies one edge condition, CALL THAT "
+                "EDGE. Call __stay_on_node__ ONLY when the data genuinely does not "
+                "yet satisfy any edge (the node is waiting for info not yet present). "
+                "Do NOT stay just because the recent history looks unrelated to this "
+                "node — there is no caller turn to evaluate here."
+            )
+        else:
+            _routing_rule = (
+                "ROUTING RULE: Call __stay_on_node__ unless the caller's message "
+                "CLEARLY and UNAMBIGUOUSLY satisfies one specific edge condition. "
+                "MANDATORY __stay_on_node__ cases:\n"
+                "- CONTEXT MISMATCH: caller says something that has nothing to do with "
+                "the agent's current question (e.g. agent asked 'can we talk?' and "
+                "caller says a year/number; agent asked yes/no and caller gave unrelated "
+                "data; the input makes no sense as an answer to the current question)\n"
+                "- Asking agent to repeat/re-read ('address बताइए', 'फिर से बोलिए', "
+                "'didn't hear', 'what was that', 'tell me again')\n"
+                "- Compliments, tangents, frustration outbursts, filler, testing phrases\n"
+                "- Partial or cut-off sentences\n"
+                "- 'no' as a correction not a goodbye\n"
+                "- 'thank you for confirming' — NOT a card receipt confirmation\n"
+                "- Any response that doesn't directly answer the agent's current question\n"
+                "OBJECTIVE RULE: Always complete the current node's objective before "
+                "transitioning. If the caller's response doesn't fulfill the objective, stay.\n"
+                "Never force-fit an off-topic response to the closest-sounding edge."
+            )
         instructions = f"{_routing_rule}\n\n{instructions}"
 
+        import re as _re
+
+        # In a silent routing pass there is no user turn to anchor on, so dumping
+        # the ENTIRE userdata into [CURRENT DATA] (15 courses + slots + every API
+        # result ≈ 8k tok) drowns the router model and it false-stays. Scope the
+        # data to the variables this node actually names (instruction + edge
+        # conditions). User-driven turns keep the full dump — unchanged.
         _slot_ctx = {k: v for k, v in userdata.items() if k != "_flow_meta" and v not in (None, "")}
+        if silent:
+            _ref_text = " ".join(
+                [node.instruction or ""] + [(e.condition or "") for e in (node.edges or [])]
+            )
+            _ref_tokens = set(_re.findall(r"[A-Za-z_]\w*", _ref_text))
+            _slot_ctx = {k: v for k, v in _slot_ctx.items() if k in _ref_tokens}
 
         # Also expose template variables referenced in the raw node instruction that
         # are null/unset — so the LLM can reason about them for silent routing nodes
         # (e.g. "name_check" routes on {{name}} which may not be in userdata).
-        import re as _re
         _TVAR_RE = _re.compile(r"\{\{\s*(\w+)\s*\}\}")
         _raw_instruction = node.instruction or ""
         _referenced_vars = {m for m in _TVAR_RE.findall(_raw_instruction)}
