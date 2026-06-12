@@ -456,6 +456,55 @@ For LLM-free unit tests, fold logs directly: `ConversationState.fold(log,
 playbook)` is a pure function, as are the expr evaluator, the renderer, and
 the compiler.
 
+**Optimize: reflective prose improvement.** `superdialog optimize` runs the
+eval loop above against a playbook, asks a candidate LLM for *targeted prose
+edits*, and keeps only edits that win a paired evaluation:
+
+```bash
+superdialog optimize --playbook booking.yaml \
+  [--rounds 3] [--n 1] [--personas personas.yaml] \
+  [--llm openai/gpt-4o-mini] [--candidate-llm M] [--user-llm M] \
+  [--out improved.booking.yaml]
+```
+
+Each round: REFLECT (worst sessions' evidence + the source YAML → a JSON
+list of `{address, new_text}` edits) → APPLY (whitelist + recompile + Jinja
+syntax check) → PAIR-EVAL (incumbent **and** candidate evaluated fresh in
+the same round, so both face the same sampling noise) → ACCEPT only on a
+strict same-round objective win. The output is the final incumbent, written
+**in the source format** — full-format playbooks stay full, simple-format
+playbooks stay simple.
+
+Only prose is editable, enforced by construction. Full format: `persona`,
+per-checkpoint `guidance`, `goal`, `never_say` (grow-only), `say_verbatim`
+(only where present), slot `description`s, and `advance_when[].when` only
+where `judge: llm`. Simple format: step `say`/`done_when`/`purpose`,
+`opening`, `closing`, `persona.identity`, `persona.voice_style` — facts,
+objections, and boundaries are never editable and survive every round.
+`expr`-judged rules, dispatch, interrupts, silence prompts, and all
+structure are frozen.
+
+Personas resolve in order: `--personas` path → cached
+`<playbook>.personas.yaml` beside the playbook → a generated 4-persona
+suite (cooperative / terse / tangent-prone / error-making) written to that
+cache for review. From Python:
+
+```python
+from superdialog.playbook import make_editable, optimize
+
+doc = make_editable(open("booking.yaml").read())
+report = await optimize(doc, personas=personas, candidate_llm=llm,
+                        user_llm=llm, agent_factory=make_agent_for)
+open("improved.yaml", "w").write(report.final_yaml)
+```
+
+`OptimizeReport` carries the initial/final objective breakdowns
+(completion, slot accuracy, smoothness, repair rate), a per-round trace
+with the exact edits applied, and an informational Pareto frontier. Cost:
+each round ≈ 2 evals × personas × n sessions × ~2 LLM calls per turn, plus
+one reflect call — the most expensive command in the tool; `n=1` with the
+default 4-persona suite keeps dev runs reasonable.
+
 ## 8. Simple authoring format
 
 The simple format is the easiest way to author a playbook: prose steps, a
@@ -499,9 +548,14 @@ What's NOT in v1: linear step sequences only; objections live in persona prose
 
 ## 9. Roadmap
 
-Clearly future, not in this release: a `superdialog optimize` command that
-consumes `EvalReport`s in a reflective improvement loop; voice-event
-plumbing in the host adapters (silence/barge-in events emitted into
-`runtime.on_external` automatically); a playbook mode for the CLI; and
-sessionless webhook workers that load a persisted log, apply a handler, and
-exit. Today's surface is what §1–§6 document.
+Shipped: `superdialog optimize` runs a reflective prose optimizer over the
+eval substrate (§6) — paired-round acceptance, prose-only targeted edits,
+simple-format round-trip, generated persona suites. **Structure mutation**
+(checkpoint split/merge/reorder, slot-schema tightening) remains future, as
+do GEPA-style frontier parent sampling, production-log feedback ingestion,
+CI metric-threshold gates, and response caching across rounds.
+
+Clearly future, not in this release: voice-event plumbing in the host
+adapters (silence/barge-in events emitted into `runtime.on_external`
+automatically); and sessionless webhook workers that load a persisted log,
+apply a handler, and exit. Today's surface is what §1–§6 and §8 document.
