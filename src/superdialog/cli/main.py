@@ -156,7 +156,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     """Interactive REPL over a flow or a playbook (auto-detected or explicit)."""
     load_dotenv()
 
-    llm = getattr(args, "llm", "openai/gpt-4o-mini") or "openai/gpt-4o-mini"
+    llm = getattr(args, "llm", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
 
     playbook_path = getattr(args, "playbook", None)
     if playbook_path:
@@ -446,7 +446,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         return 1
 
     output = getattr(args, "output", "flow.json") or "flow.json"
-    llm = getattr(args, "llm", "openai/gpt-4o-mini") or "openai/gpt-4o-mini"
+    llm = getattr(args, "llm", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
 
     print(f"Generating flow using {llm}...", flush=True)
     flow = asyncio.run(create_dialog_flow(prompt=prompt.strip(), llm=llm))
@@ -676,7 +676,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to a simple-format playbook (YAML/JSON); compiles then runs",
     )
-    chat.add_argument("--llm", default="openai/gpt-4o-mini")
+    chat.add_argument("--llm", default="openai/gpt-4.1-mini")
     chat.add_argument(
         "--adapter",
         default="toolcall",

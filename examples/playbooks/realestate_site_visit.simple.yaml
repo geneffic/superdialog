@@ -40,12 +40,13 @@ playbook:
     collect: [can_talk_now]
     done_when: "Customer agrees to talk, or explicitly says busy/no."
   - id: identify_caller
-    purpose: "Capture the customer's name if not already known."
+    purpose: "Capture the customer's name."
     say: >-
-      If we don't already know their name, ask politely for it. If we do,
-      acknowledge them by name and move on. Don't ask for name twice.
+      Ask ONLY for the caller's name. One question, wait for answer. Do NOT
+      ask about budget, configuration, possession, location, or any
+      qualification at this step.
     collect: [name]
-    done_when: "Name is captured or confirmed not necessary."
+    done_when: "Caller explicitly stated their name."
   - id: confirm_language
     purpose: "One-time check on preferred language."
     say: >-
@@ -58,7 +59,8 @@ playbook:
     say: >-
       Briefly state this is regarding their interest in Parkview Residences in
       the developing suburb, and ask if it's okay to continue. Keep it to one
-      sentence.
+      sentence. Do NOT capture visit dates, times, budget, or any qualification
+      data at this step.
     collect: [permission_to_continue]
     done_when: "Customer permits or declines continuation."
   - id: pitch_project_short
@@ -112,22 +114,25 @@ playbook:
       sample apartment, layout, location, construction progress, amenities,
       pricing clarity. If this is the second attempt and they hesitate again,
       route to a fallback (message or advisor callback) rather than pushing a
-      third time.
-    done_when: "Customer accepts, hesitates, or declines."
+      third time. Do NOT confirm or schedule the visit here — only offer it.
+    collect: [visit_offered]
+    done_when: "Customer accepts, hesitates, or declines the visit offer."
   - id: confirm_qualification
     purpose: "Confirm Budget, Possession, Configuration, Location alignment."
     say: >-
       Before scheduling, confirm the four points — Budget, Possession,
       Configuration, Location — one at a time, only asking about points that
       aren't already aligned. If any point shows misalignment, route to the
-      relevant objection-handling step before attempting to schedule.
+      relevant objection-handling step before attempting to schedule. Do NOT
+      schedule or confirm a date/time at this step.
     collect: [budget_ok, possession_ok, configuration_ok, location_ok]
     done_when: "All four alignment points are confirmed."
   - id: capture_visit_slot
     purpose: "Capture day and time for the visit."
     say: >-
-      Ask which day, date, and time would be most convenient. Capture both day
-      and an approximate time. Suggest today or tomorrow if they're warm.
+      Ask which day and time would be most convenient. Always ask explicitly —
+      do NOT assume a date or time from anything said earlier in the
+      conversation. Capture both day and an approximate time.
     collect: [visit_day, visit_time]
     done_when: "Day and time are captured."
   - id: confirm_visit_and_family
@@ -257,6 +262,12 @@ boundaries:
   - "NEVER read out labels, brackets, instructions, or internal notes."
   - "If the customer asks to be removed / do-not-call, acknowledge and close politely without pushing further."
   - "If the customer is abusive or non-engaging, close politely and end the call."
+interrupts:
+- id: global_goodbye
+  when: >-
+    Caller says goodbye, bye, ok thanks, no thanks, take care, or otherwise
+    signals they want to end the call — and the call is not already closing.
+  to: main.deliver_closing
 fallback_actions:
   advisor_callback: >-
     Capture a convenient callback time and tell them an advisor will reach out

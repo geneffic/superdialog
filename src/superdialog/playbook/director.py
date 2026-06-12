@@ -199,9 +199,9 @@ class Director:
         )
         events: list[Event] = []
         for key, value in (verdict.get("slots") or {}).items():
-            slot_spec = cp.slots.get(key) or self._pb.slot_spec(key)
+            slot_spec = cp.slots.get(key)
             if slot_spec is None or slot_spec.authoritative:
-                continue  # unknown key, or authoritative: tool-written only
+                continue  # reject slots not defined in current checkpoint, or authoritative
             coerced = _coerce_slot(value, slot_spec)
             if coerced is _INVALID:
                 continue  # bad cast / enum miss: treat as not extracted
