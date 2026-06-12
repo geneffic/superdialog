@@ -161,14 +161,14 @@ journeys:
         requires:
         - can_talk_now
     - id: identify_caller
-      goal: Capture the customer's name if not already known.
+      goal: Capture the customer's name.
       slots:
         name: {}
-      guidance: 'If we don''t already know their name, ask politely for it. If we do,
-
-        acknowledge them by name and move on. Don''t ask for name twice.'
+      guidance: 'Ask ONLY for the caller''s name. One question, wait for answer. Do
+        NOT ask about budget, configuration, possession, location, or any qualification
+        at this step.'
       advance_when:
-      - when: Name is captured or confirmed not necessary.
+      - when: Caller explicitly stated their name.
         to: main.confirm_language
         requires:
         - name
@@ -189,10 +189,9 @@ journeys:
       slots:
         permission_to_continue: {}
       guidance: 'Briefly state this is regarding their interest in Parkview Residences
-
         in the developing suburb, and ask if it''s okay to continue. Keep it to one
-
-        sentence.'
+        sentence. Do NOT capture visit dates, times, budget, or any qualification
+        data at this step.'
       advance_when:
       - when: Customer permits or declines continuation.
         to: main.pitch_project_short
@@ -278,18 +277,20 @@ journeys:
         to: main.pitch_site_visit
     - id: pitch_site_visit
       goal: Softly offer a site visit. Limit to TWO attempts in the call.
+      slots:
+        visit_offered:
+          type: bool
+          description: True once the site-visit offer has been made in this checkpoint.
       guidance: 'Offer a visit at the customer''s convenience, framing the benefit:
-
-        see the sample apartment, layout, location, construction progress,
-
-        amenities, pricing clarity. If this is the second attempt and they
-
-        hesitate again, route to a fallback (message or advisor callback)
-
-        rather than pushing a third time.'
+        see the sample apartment, layout, location, construction progress, amenities,
+        pricing clarity. If this is the second attempt and they hesitate again, route
+        to a fallback (message or advisor callback) rather than pushing a third time.
+        Do NOT confirm or schedule the visit here — only offer it.'
       advance_when:
-      - when: Customer accepts, hesitates, or declines.
+      - when: Customer accepts, hesitates, or declines the visit offer.
         to: main.confirm_qualification
+        requires:
+        - visit_offered
     - id: confirm_qualification
       goal: Confirm Budget, Possession, Configuration, Location alignment.
       slots:
@@ -298,12 +299,10 @@ journeys:
         configuration_ok: {}
         location_ok: {}
       guidance: 'Before scheduling, confirm the four points — Budget, Possession,
-
-        Configuration, Location — one at a time, only asking about points that
-
-        aren''t already aligned. If any point shows misalignment, route to the
-
-        relevant objection-handling step before attempting to schedule.'
+        Configuration, Location — one at a time, only asking about points that aren''t
+        already aligned. If any point shows misalignment, route to the relevant
+        objection-handling step before attempting to schedule. Do NOT schedule the
+        visit or confirm a date/time at this step.'
       advance_when:
       - when: All four alignment points are confirmed.
         to: main.capture_visit_slot
@@ -317,9 +316,9 @@ journeys:
       slots:
         visit_day: {}
         visit_time: {}
-      guidance: 'Ask which day, date, and time would be most convenient. Capture both
-
-        day and an approximate time. Suggest today or tomorrow if they''re warm.'
+      guidance: 'Ask which day and time would be most convenient. Always ask explicitly
+        — do NOT assume a date or time from anything said earlier in the conversation.
+        Capture both day and an approximate time. Suggest today or tomorrow if warm.'
       advance_when:
       - when: Day and time are captured.
         to: main.confirm_visit_and_family
@@ -355,3 +354,8 @@ journeys:
       guidance: Deliver the script's closing line and end the call.
       terminal: true
       outcome: closed
+interrupts:
+- id: global_goodbye
+  when: Caller says goodbye, bye, ok thanks, no thanks, take care, or otherwise signals
+    they want to end the call — AND the call is not already closing.
+  to: main.deliver_closing

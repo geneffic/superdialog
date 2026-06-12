@@ -19,7 +19,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from .models import AdvanceRule, Checkpoint, Journey, Playbook, SlotSpec
+from .models import AdvanceRule, Checkpoint, InterruptSpec, Journey, Playbook, SlotSpec
 
 
 class SimplePersona(BaseModel):
@@ -44,6 +44,12 @@ class SimpleObjection(BaseModel):
     handle: str
 
 
+class SimpleInterrupt(BaseModel):
+    id: str = ""
+    when: str
+    to: str
+
+
 class SimplePlaybook(BaseModel):
     name: str = ""
     goal: str = ""
@@ -55,6 +61,7 @@ class SimplePlaybook(BaseModel):
     objections: list[SimpleObjection] = Field(default_factory=list)
     boundaries: list[str] = Field(default_factory=list)
     fallback_actions: dict[str, str] = Field(default_factory=dict)
+    interrupts: list[SimpleInterrupt] = Field(default_factory=list)
 
 
 def is_simple_playbook(doc: Any) -> bool:
@@ -219,9 +226,18 @@ def simple_to_playbook(doc: dict[str, Any]) -> Playbook:
         next_id = None if is_last else f"main.{sp.playbook[i + 1].id}"
         opening = sp.opening if i == 0 else ""
         checkpoints.append(_step_to_checkpoint(step, next_id, opening))
+    interrupts = [
+        InterruptSpec(
+            id=intr.id or f"interrupt_{i}",
+            when=intr.when,
+            to=intr.to,
+        )
+        for i, intr in enumerate(sp.interrupts)
+    ]
     return Playbook(
         persona=_build_persona(sp),
         journeys={"main": Journey(checkpoints=checkpoints)},
+        interrupts=interrupts,
     )
 
 

@@ -49,9 +49,7 @@ def _recorded_log() -> EventLog:
     )
     log.append(UtteranceEvent(role="assistant", text="Your booking is held."))
     log.append(UtteranceEvent(role="user", text="yes, Pune is right"))
-    log.append(
-        SlotWriteEvent(key="city", value="Pune", status="confirmed", by="director")
-    )
+    # city is scoped to booking.collect — no slot write at booking.confirm
     return log
 
 
@@ -61,7 +59,7 @@ _STABLE_VERDICTS = [
         "advance": "booking.confirm",
         "note": None,
     },
-    {"slots": {"city": "Pune"}, "advance": None, "note": None},
+    {"slots": {}, "advance": None, "note": None},
 ]
 
 
@@ -70,7 +68,7 @@ async def test_stable_replay() -> None:
     report = await replay(_recorded_log(), pb, SequencedLLM(_STABLE_VERDICTS))
     assert report.turns == 2
     assert report.advance_matches == 1
-    assert report.slot_matches == 3  # city+date on turn 1, city on turn 2
+    assert report.slot_matches == 2  # city+date on turn 1; city scoped to collect, not confirm
     assert report.diffs == []
     assert report.stable
 
