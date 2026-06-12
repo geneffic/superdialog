@@ -6,7 +6,7 @@ import json
 from statistics import mean
 
 from jinja2 import Environment, TemplateSyntaxError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .director import CompletesLLM
 from .editable import Edit, EditableDoc
@@ -147,6 +147,51 @@ def _check_jinja(edits: list[Edit]) -> None:
                 _JINJA.parse(edit.new_text)
             except TemplateSyntaxError as exc:
                 raise ValueError(f"{edit.address}: broken Jinja: {exc}") from exc
+
+
+class RoundTrace(BaseModel):
+    """One optimization round: same-round paired scores plus the edit list."""
+
+    round_no: int
+    accepted: bool
+    incumbent_breakdown: ObjectiveBreakdown
+    candidate_breakdown: ObjectiveBreakdown | None = None
+    edits: list[Edit] = Field(default_factory=list)
+    detail: str = ""
+
+
+class ParetoFrontier(BaseModel):
+    """Non-dominated candidate rounds over completion/slot/smoothness.
+
+    Informational only: the loop never picks its output from the frontier
+    (cross-round scores come from different eval runs).
+    """
+
+    members: list[RoundTrace] = Field(default_factory=list)
+
+    @staticmethod
+    def _vector(t: RoundTrace) -> tuple[float, float, float]:
+        b = t.candidate_breakdown
+        assert b is not None  # consider() filters None
+        return (
+            b.completion_rate,
+            b.slot_accuracy,
+            _smoothness(b.mean_turns_per_checkpoint),
+        )
+
+    @classmethod
+    def _dominates(cls, a: RoundTrace, b: RoundTrace) -> bool:
+        va, vb = cls._vector(a), cls._vector(b)
+        return all(x >= y for x, y in zip(va, vb)) and va != vb
+
+    def consider(self, t: RoundTrace) -> None:
+        """Add `t` unless dominated; evict members it dominates."""
+        if t.candidate_breakdown is None:
+            return
+        if any(self._dominates(m, t) for m in self.members):
+            return
+        self.members = [m for m in self.members if not self._dominates(t, m)]
+        self.members.append(t)
 
 
 async def propose_edits(

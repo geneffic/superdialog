@@ -6,6 +6,8 @@ from superdialog.playbook.editable import FullDoc
 from superdialog.playbook.eval_bridge import EvalReport, SessionMetrics
 from superdialog.playbook.optimize import (
     ObjectiveBreakdown,
+    ParetoFrontier,
+    RoundTrace,
     propose_edits,
     score_report,
 )
@@ -181,3 +183,50 @@ async def test_empty_edit_list_is_rejected() -> None:
     doc = FullDoc.from_text(MINIMAL_YAML)
     llm = CannedEditsLLM(["[]"])
     assert await propose_edits(doc, _report(), llm, max_attempts=1) is None
+
+
+def _breakdown(completion: float, slot: float, turns: float) -> ObjectiveBreakdown:
+    return ObjectiveBreakdown(
+        objective=completion,
+        completion_rate=completion,
+        slot_accuracy=slot,
+        mean_turns_per_checkpoint=turns,
+        repair_rate=0.0,
+    )
+
+
+def _trace(round_no: int, completion: float, slot: float, turns: float) -> RoundTrace:
+    return RoundTrace(
+        round_no=round_no,
+        accepted=True,
+        incumbent_breakdown=_breakdown(0.1, 0.1, 9.0),
+        candidate_breakdown=_breakdown(completion, slot, turns),
+    )
+
+
+def test_frontier_keeps_non_dominated() -> None:
+    f = ParetoFrontier()
+    f.consider(_trace(1, completion=0.9, slot=0.5, turns=2.0))
+    f.consider(_trace(2, completion=0.5, slot=0.9, turns=2.0))  # trades off
+    f.consider(_trace(3, completion=0.4, slot=0.4, turns=3.0))  # dominated
+    assert sorted(t.round_no for t in f.members) == [1, 2]
+
+
+def test_frontier_drops_newly_dominated_member() -> None:
+    f = ParetoFrontier()
+    f.consider(_trace(1, completion=0.6, slot=0.6, turns=2.0))
+    f.consider(_trace(2, completion=0.9, slot=0.9, turns=1.0))  # dominates #1
+    assert [t.round_no for t in f.members] == [2]
+
+
+def test_frontier_ignores_rounds_without_a_candidate() -> None:
+    f = ParetoFrontier()
+    f.consider(
+        RoundTrace(
+            round_no=1,
+            accepted=False,
+            incumbent_breakdown=_breakdown(0.5, 0.5, 2.0),
+            detail="no valid candidate",
+        )
+    )
+    assert f.members == []
