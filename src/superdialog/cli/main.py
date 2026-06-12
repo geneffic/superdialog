@@ -223,6 +223,135 @@ def _chat_simple(path: str, llm: str) -> int:
     return 0
 
 
+def _run_optimize(
+    playbook_path: str,
+    *,
+    rounds: int,
+    n: int,
+    personas_path: str | None,
+    llm: str,
+    candidate_llm: str | None,
+    user_llm: str | None,
+) -> tuple[str, list[str]]:
+    """Run the optimize loop against real providers; return (yaml, trace lines)."""
+    from ..llm.resolver import resolve_llm
+    from ..playbook import (
+        Playbook,
+        PlaybookAgent,
+        httpx_http,
+        make_editable,
+        optimize,
+        provider_adapters,
+    )
+    from ..playbook.personas import (
+        derive_default_persona,
+        generate_personas,
+        load_personas,
+        persona_cache_path,
+        save_personas,
+    )
+
+    doc = make_editable(Path(playbook_path).read_text(encoding="utf-8"))
+    director, talker = provider_adapters(resolve_llm(llm))
+    cand = (
+        provider_adapters(resolve_llm(candidate_llm))[0] if candidate_llm else director
+    )
+    user = provider_adapters(resolve_llm(user_llm))[0] if user_llm else director
+
+    def agent_factory(pb: "Playbook") -> "PlaybookAgent":
+        return PlaybookAgent(
+            playbook=pb, talker_llm=talker, director_llm=director, http=httpx_http
+        )
+
+    notes: list[str] = []
+
+    async def _go() -> Any:
+        playbook = doc.compile()
+        cache = persona_cache_path(playbook_path)
+        if personas_path:
+            personas = load_personas(personas_path)
+        elif Path(cache).exists():
+            personas = load_personas(cache)
+            notes.append(f"personas: loaded cache {cache}")
+        else:
+            try:
+                personas = await generate_personas(playbook, cand)
+                save_personas(personas, cache)
+                notes.append(f"personas: generated suite -> {cache} (review it)")
+            except ValueError as exc:
+                personas = [derive_default_persona(playbook)]
+                notes.append(
+                    f"personas: generation failed ({exc}); using one derived persona"
+                )
+        return await optimize(
+            doc,
+            personas=personas,
+            candidate_llm=cand,
+            user_llm=user,
+            agent_factory=agent_factory,
+            rounds=rounds,
+            n=n,
+        )
+
+    report = asyncio.run(_go())
+    lines = list(notes)
+    for t in report.trace:
+        if t.candidate_breakdown is None:
+            lines.append(f"round {t.round_no}: {t.detail}")
+        else:
+            n_edits = len(t.edits)
+            verdict = (
+                f"accepted ({n_edits} edit{'s' if n_edits != 1 else ''})"
+                if t.accepted
+                else "rejected"
+            )
+            lines.append(
+                f"round {t.round_no}: incumbent "
+                f"{t.incumbent_breakdown.objective:.2f} vs candidate "
+                f"{t.candidate_breakdown.objective:.2f} - {verdict}"
+            )
+    lines.append(
+        f"objective: {report.initial_breakdown.objective:.2f} -> "
+        f"{report.final_breakdown.objective:.2f}"
+    )
+    return report.final_yaml, lines
+
+
+def _cmd_optimize(args: argparse.Namespace) -> int:
+    """Validate inputs, run the loop, write the improved playbook."""
+    path = args.playbook
+    if not Path(path).exists():
+        print(f"Playbook not found: {path}", file=sys.stderr)
+        return 1
+    try:  # pre-flight either format; surface schema errors as one line
+        if _looks_like_simple_playbook(path):
+            from ..playbook.simple import load_simple
+
+            load_simple(path)
+        else:
+            from ..playbook import Playbook
+
+            Playbook.load(path)
+    except Exception as exc:
+        print(f"Invalid playbook {path}: {exc}", file=sys.stderr)
+        return 1
+    out = args.out or str(Path(path).parent / f"improved.{Path(path).name}")
+    final_yaml, lines = _run_optimize(
+        path,
+        rounds=args.rounds,
+        n=args.n,
+        personas_path=args.personas,
+        llm=args.llm,
+        candidate_llm=args.candidate_llm,
+        user_llm=args.user_llm,
+    )
+    Path(out).write_text(final_yaml, encoding="utf-8")
+    for line in lines:
+        print(line)
+    print(f"Wrote {out}")
+    return 0
+
+
 def _cmd_lint(args: argparse.Namespace) -> int:
     """Validate edge target references; exit non-zero on broken refs."""
     flow = Flow.load(args.flow)
@@ -404,6 +533,39 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     generate.add_argument("--llm", default="openai/gpt-4o-mini")
     generate.set_defaults(fn=_cmd_generate)
+
+    opt = sub.add_parser(
+        "optimize", help="Reflectively improve a playbook's prose via self-play"
+    )
+    opt.add_argument(
+        "--playbook",
+        required=True,
+        help="Path to a playbook (full or simple format)",
+    )
+    opt.add_argument("--rounds", type=int, default=3)
+    opt.add_argument(
+        "--n", type=int, default=1, help="Eval sessions per persona per side"
+    )
+    opt.add_argument(
+        "--personas", default=None, help="Path to a PersonaSpec list (YAML/JSON)"
+    )
+    opt.add_argument("--llm", default="openai/gpt-4o-mini")
+    opt.add_argument(
+        "--candidate-llm",
+        default=None,
+        help="Override the reflecting LLM (default: --llm)",
+    )
+    opt.add_argument(
+        "--user-llm",
+        default=None,
+        help="Override the caller-simulator LLM (default: --llm)",
+    )
+    opt.add_argument(
+        "--out",
+        default=None,
+        help="Output path (default: improved.<name>, same format)",
+    )
+    opt.set_defaults(fn=_cmd_optimize)
 
     return parser
 
