@@ -3598,7 +3598,7 @@ wheels = [
 
 [[package]]
 name = "superdialog"
-version = "0.2.3"
+version = "0.2.5"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -3619,6 +3619,9 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+]
+evals = [
+    { name = "openai" },
 ]
 fastapi = [
     { name = "fastapi" },
@@ -3652,6 +3655,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.50" },
     { name = "livekit-agents", marker = "extra == 'livekit'", specifier = ">=0.12" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=0.9" },
+    { name = "openai", marker = "extra == 'evals'", specifier = ">=1.0" },
     { name = "pipecat-ai", marker = "extra == 'pipecat'", specifier = ">=0.0.50" },
     { name = "pydantic", specifier = ">=2.5" },
     { name = "pyrefly", marker = "extra == 'dev'", specifier = ">=0.1" },
@@ -3665,7 +3669,7 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'fastapi'", specifier = ">=0.27" },
     { name = "websockets", marker = "extra == 'ws'", specifier = ">=12" },
 ]
-provides-extras = ["livekit", "pipecat", "fastapi", "ws", "mcp", "langchain", "dev"]
+provides-extras = ["livekit", "pipecat", "fastapi", "ws", "mcp", "langchain", "dev", "evals"]
 
 [[package]]
 name = "sympy"

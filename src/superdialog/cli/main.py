@@ -1,4 +1,4 @@
-"""superdialog CLI: chat / flow lint / flow draw / flow generate.
+"""superdialog CLI: chat / flow lint / flow draw / flow generate / playbook.
 
 Each subcommand operates on a flow file (JSON or YAML) loaded via
 :meth:`superdialog.Flow.load`. The CLI is intentionally thin -- it
@@ -13,8 +13,9 @@ import asyncio
 import sys
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, AsyncIterator, Sequence
 
+import yaml
 from dotenv import load_dotenv
 
 from .. import DialogMachine, Flow, create_dialog_flow
@@ -225,6 +226,144 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     return 0
 
 
+def _compile_flow_to_yaml(flow_path: str) -> str:
+    """Compile a ConversationFlow JSON to Playbook YAML string."""
+    from superdialog.flow.models import ConversationFlow
+    from superdialog.playbook import compile_flow
+
+    flow = ConversationFlow.load(flow_path)
+    pb = compile_flow(flow)
+    return yaml.safe_dump(
+        pb.model_dump(mode="json", exclude_defaults=True),
+        sort_keys=False,
+        allow_unicode=True,
+        width=80,
+    )
+
+
+def _cmd_playbook_compile(args: argparse.Namespace) -> int:
+    """Compile a flow JSON to Playbook YAML; emit to stdout or --output file."""
+    text = _compile_flow_to_yaml(args.flow)
+    output = getattr(args, "output", None)
+    if output:
+        Path(output).write_text(text)
+        print(f"Written: {output}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+async def _playbook_chat_loop(playbook_path: str, model: str) -> None:
+    import anyio
+
+    from superdialog.llm.litellm_provider import LitellmProvider
+    from superdialog.playbook import Playbook, httpx_http
+    from superdialog.playbook.director import Director
+    from superdialog.playbook.runtime import PlaybookRuntime
+    from superdialog.playbook.talker import Talker
+
+    class _DirectorLLM:
+        def __init__(self, provider: LitellmProvider) -> None:
+            self._p = provider
+
+        async def complete(self, messages: list[dict[str, str]], **kw: Any) -> str:
+            return (await self._p.complete(list(messages))).text
+
+    class _TalkerLLM:
+        def __init__(self, provider: LitellmProvider) -> None:
+            self._p = provider
+
+        async def stream(
+            self, messages: list[dict[str, str]], **kw: Any
+        ) -> AsyncIterator[str]:
+            async for chunk in self._p.stream(list(messages)):
+                if chunk.text:
+                    yield chunk.text
+
+    provider = LitellmProvider(model)
+    playbook = Playbook.load(playbook_path)
+    runtime = PlaybookRuntime(
+        playbook, director_llm=_DirectorLLM(provider), http=httpx_http
+    )
+    talker = Talker(playbook, llm=_TalkerLLM(provider))
+
+    async def _speak() -> None:
+        print("agent> ", end="", flush=True)
+        async for chunk in talker.speak(runtime.state):
+            if chunk.text:
+                print(chunk.text, end="", flush=True)
+        print()
+
+    print(f"Playbook demo on {model} — type 'quit' to exit.\n")
+    await runtime.start()
+    await _speak()
+
+    while True:
+        try:
+            text = await anyio.to_thread.run_sync(input, "you> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if text.strip().lower() in {"quit", "exit"}:
+            break
+        if not text.strip():
+            continue
+        cp_before = runtime.state.checkpoint_id
+        await runtime.on_user_text(text)
+        cp_after = runtime.state.checkpoint_id
+        print(f"[DEBUG] {cp_before} → {cp_after}  ended={runtime.state.ended}",
+              file=sys.stderr)
+        await _speak()
+        if runtime.state.ended:
+            print(f"[session ended — outcome: {runtime.state.outcome}]")
+            break
+
+
+def _cmd_playbook_chat(args: argparse.Namespace) -> int:
+    """Run the playbook REPL against an existing YAML file."""
+    load_dotenv()
+    playbook_path = args.playbook
+    if not Path(playbook_path).exists():
+        print(f"Playbook not found: {playbook_path}", file=sys.stderr)
+        return 1
+    model = getattr(args, "model", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+    import anyio
+    anyio.run(_playbook_chat_loop, playbook_path, model)
+    return 0
+
+
+def _cmd_playbook_run(args: argparse.Namespace) -> int:
+    """Compile a flow JSON to a playbook YAML, then start the REPL."""
+    load_dotenv()
+    import tempfile
+    model = getattr(args, "model", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+
+    # If arg is already a .yaml/.yml file, skip compile
+    src = args.flow
+    if src.endswith((".yaml", ".yml")):
+        playbook_path = src
+    else:
+        text = _compile_flow_to_yaml(src)
+        output = getattr(args, "output", None)
+        if output:
+            Path(output).write_text(text)
+            playbook_path = output
+            print(f"Compiled → {output}", file=sys.stderr)
+        else:
+            # Write to a temp file so the REPL can load it
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=".yaml", delete=False, mode="w", encoding="utf-8"
+            )
+            tmp.write(text)
+            tmp.close()
+            playbook_path = tmp.name
+            print(f"Compiled → {playbook_path} (temp)", file=sys.stderr)
+
+    import anyio
+    anyio.run(_playbook_chat_loop, playbook_path, model)
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="superdialog")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -279,6 +418,41 @@ def _build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--llm", default="openai/gpt-4o-mini")
     generate.set_defaults(fn=_cmd_generate)
 
+    # -- playbook subcommand group ------------------------------------------
+    pb = sub.add_parser("playbook", help="Compile and run Playbook engine sessions")
+    pb_sub = pb.add_subparsers(dest="pb_subcmd", required=True)
+
+    pb_compile = pb_sub.add_parser(
+        "compile", help="Compile a flow JSON to Playbook YAML"
+    )
+    pb_compile.add_argument("flow", help="Path to flow JSON")
+    pb_compile.add_argument(
+        "--output", "-o", default=None, help="Output YAML file (default: stdout)"
+    )
+    pb_compile.set_defaults(fn=_cmd_playbook_compile)
+
+    pb_chat = pb_sub.add_parser(
+        "chat", help="Interactive REPL against an existing Playbook YAML"
+    )
+    pb_chat.add_argument("--playbook", required=True, help="Path to playbook YAML")
+    pb_chat.add_argument(
+        "--model", default="openai/gpt-4.1-mini", help="LiteLLM model string"
+    )
+    pb_chat.set_defaults(fn=_cmd_playbook_chat)
+
+    pb_run = pb_sub.add_parser(
+        "run", help="Compile a flow JSON and immediately start a Playbook REPL"
+    )
+    pb_run.add_argument("flow", help="Path to flow JSON (or existing .yaml to skip compile)")
+    pb_run.add_argument(
+        "--output", "-o", default=None, help="Save compiled YAML here (default: temp file)"
+    )
+    pb_run.add_argument(
+        "--model", default="openai/gpt-4.1-mini", help="LiteLLM model string"
+    )
+    pb_run.set_defaults(fn=_cmd_playbook_run)
+
+    # -- eval subcommand ----------------------------------------------------
     eval_cmd = sub.add_parser(
         "eval",
         help="Eval a flow: audit real session (--traversal) or run synthetic corpus",
